@@ -538,54 +538,39 @@ document.addEventListener("submit", e => {
   if (e.target.id === "plant-form") savePlant(e.target);
   else if (e.target.id === "task-form") saveTask(e.target);
   else if (e.target.id === "g-form") { const i = $("#g-name"); addGrocery(i.value); i.value = ""; i.focus(); }
-  else if (e.target.id === "login-email") sendCode(e.target);
-  else if (e.target.id === "login-code") verifyCode(e.target);
+  else if (e.target.id === "login-form") signIn(e.target);
 });
 document.querySelectorAll("nav.tabs button").forEach(b => b.addEventListener("click", () => setTab(b.dataset.tab)));
 $("#btn-settings").addEventListener("click", settingsSheet);
 
-/* ---------- login (code à 6 chiffres par e-mail) ---------- */
+/* ---------- login (e-mail + mot de passe ; comptes créés dans Supabase > Authentication > Users) ---------- */
 let loginEmail = "";
-function showLogin(step = "email", msg = "") {
+function showLogin(msg = "") {
   $("#app").hidden = true; $("#login").hidden = false;
   if (!CONFIGURED) {
     $("#login").innerHTML = `<div class="card"><div class="logo">${icon("home", 30)}</div><h1>Configuration requise</h1>
       <p class="hint">Renseigne l'URL et la clé de ton projet Supabase dans <code>config.js</code>, puis redéploie. Le README détaille chaque étape.</p></div>`;
     return;
   }
-  $("#login").innerHTML = step === "email" ? `
-    <form class="card" id="login-email">
+  $("#login").innerHTML = `
+    <form class="card" id="login-form">
       <div class="logo">${icon("home", 30)}</div>
       <h1>Carnet de maison</h1>
-      <p class="hint">Plantes, entretien et courses du foyer. Entre ton adresse : tu reçois un code de connexion à 6 chiffres.</p>
-      <label class="field"><span>Adresse e-mail</span><input type="email" id="l-email" required autocomplete="email" inputmode="email" value="${esc(loginEmail)}"></label>
-      ${msg ? `<div class="status err">${esc(msg)}</div>` : ""}
-      <button class="btn wide" type="submit">Recevoir un code</button>
-    </form>` : `
-    <form class="card" id="login-code">
-      <div class="logo">${icon("home", 30)}</div>
-      <h1>Vérifie tes e-mails</h1>
-      <p class="hint">Code envoyé à <b>${esc(loginEmail)}</b>. Il est valable une heure.</p>
-      <label class="field"><span>Code reçu</span><input type="text" id="l-code" class="code-input" required inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6,10}" maxlength="10"></label>
+      <p class="hint">Plantes, entretien et courses du foyer.</p>
+      <label class="field"><span>Adresse e-mail</span><input type="email" id="l-email" required autocomplete="username" inputmode="email" value="${esc(loginEmail)}"></label>
+      <label class="field"><span>Mot de passe</span><input type="password" id="l-pass" required autocomplete="current-password"></label>
       ${msg ? `<div class="status err">${esc(msg)}</div>` : ""}
       <button class="btn wide" type="submit">Se connecter</button>
-      <button class="btn ghost wide" type="button" id="l-back">Changer d'adresse</button>
+      <p class="hint">Mot de passe oublié ? La personne qui gère l'app peut le réinitialiser depuis Supabase.</p>
     </form>`;
-  const back = $("#l-back"); if (back) back.onclick = () => showLogin("email");
-  const first = $("#login input"); if (first) first.focus();
+  const first = loginEmail ? $("#l-pass") : $("#l-email"); if (first) first.focus();
 }
-async function sendCode(form) {
+async function signIn(form) {
   loginEmail = $("#l-email").value.trim().toLowerCase();
-  const btn = form.querySelector("button[type=submit]"); btn.disabled = true; btn.textContent = "Envoi…";
-  const { error } = await sb.auth.signInWithOtp({ email: loginEmail, options: { shouldCreateUser: true } });
-  if (error) { showLogin("email", error.status === 429 ? "Trop de demandes. Patiente une minute avant de redemander un code." : "L'envoi du code a échoué. Vérifie l'adresse et réessaie."); return; }
-  showLogin("code");
-}
-async function verifyCode(form) {
-  const token = $("#l-code").value.trim();
-  const btn = form.querySelector("button[type=submit]"); btn.disabled = true; btn.textContent = "Vérification…";
-  const { error } = await sb.auth.verifyOtp({ email: loginEmail, token, type: "email" });
-  if (error) showLogin("code", "Code incorrect ou expiré. Vérifie le dernier e-mail reçu.");
+  const password = $("#l-pass").value;
+  const btn = form.querySelector("button[type=submit]"); btn.disabled = true; btn.textContent = "Connexion…";
+  const { error } = await sb.auth.signInWithPassword({ email: loginEmail, password });
+  if (error) showLogin(error.status === 429 ? "Trop de tentatives. Patiente une minute." : !navigator.onLine ? "Pas de connexion internet." : "E-mail ou mot de passe incorrect.");
 }
 
 /* ---------- boot ---------- */
@@ -625,9 +610,9 @@ else {
     if (session && session.user && !started) { started = true; setTimeout(() => startApp(session.user), 0); }
     if (!session && event === "SIGNED_OUT") {
       started = false; S.user = null;
-      if (store.channel) { sb.removeChannel(store.channel); store.channel = null; } TABLES.forEach(t => { try { localStorage.removeItem("maison:" + t); } catch (e) { } }); showLogin("email"); }
+      if (store.channel) { sb.removeChannel(store.channel); store.channel = null; } TABLES.forEach(t => { try { localStorage.removeItem("maison:" + t); } catch (e) { } }); showLogin(); }
   });
-  sb.auth.getSession().then(({ data }) => { if (!data.session) showLogin("email"); });
+  sb.auth.getSession().then(({ data }) => { if (!data.session) showLogin(); });
 }
 
 window.addEventListener("online", () => { if (S.user) { store.fetchAll().catch(() => { }); store.subscribe(); } });

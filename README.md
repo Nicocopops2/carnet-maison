@@ -13,7 +13,7 @@ Chaque matin, une notification te rappelle ce qui est dû. Les données sont syn
 | Brique | Rôle | Coût |
 |---|---|---|
 | GitHub Pages | Héberge les fichiers statiques (HTML/CSS/JS), en HTTPS | Gratuit |
-| Supabase (Postgres + Auth + Realtime) | Données, connexion par code e-mail, synchronisation en direct | Offre gratuite |
+| Supabase (Postgres + Auth + Realtime) | Données, connexion par e-mail + mot de passe, synchronisation en direct | Offre gratuite |
 | Supabase Edge Function `identify-plant` | Envoie la photo à l'API Claude sans exposer la clé | Facturé à l'usage par Anthropic, de l'ordre du centime par photo |
 | Supabase Edge Function `send-reminders` + pg_cron | Calcule les échéances et envoie les notifications push chaque matin | Gratuit |
 
@@ -50,19 +50,18 @@ Prérequis : un compte GitHub, un compte [Supabase](https://supabase.com), une c
 > Pour ajouter quelqu'un plus tard :
 > `insert into members (email) values ('nouvelle@adresse.fr');`
 
-### 3. Configurer la connexion par code
+### 3. Créer les comptes du foyer
 
-L'app se connecte avec un **code à 6 chiffres** reçu par e-mail, et non avec un lien magique. Sur iPhone, l'app installée et Safari ne partagent pas la même session : un lien magique ouvrirait Safari au lieu de l'app.
+L'app se connecte par **e-mail + mot de passe**. Les comptes sont créés à la main dans Supabase, ce qui évite d'envoyer des e-mails : depuis peu, Supabase exige un serveur SMTP personnel pour modifier ses modèles d'e-mail.
 
-1. Va dans **Authentication → Email Templates**. Dans les deux modèles **Magic Link** et **Confirm signup**, remplace le contenu par exemple par :
-   ```html
-   <h2>Ton code de connexion</h2>
-   <p>Saisis ce code dans le Carnet de maison :</p>
-   <p style="font-size:28px;letter-spacing:6px"><b>{{ .Token }}</b></p>
-   ```
-2. Dans **Authentication → URL Configuration**, mets ton futur site GitHub Pages (étape 7) dans **Site URL**, par exemple `https://ton-pseudo.github.io/carnet-maison/`.
+1. Va dans **Authentication → Users**, puis **Add user → Create new user**.
+2. Saisis l'adresse e-mail et un mot de passe, et coche **Auto Confirm User**. Fais de même pour chaque membre du foyer.
+3. Chaque adresse doit aussi figurer dans la table `members` (étape 2).
+4. Recommandé : dans **Authentication → Sign In / Providers**, désactive **Allow new users to sign up**. Personne d'autre ne pourra alors créer de compte. Ces comptes ne verraient de toute façon aucune donnée, grâce aux règles RLS.
 
-> L'envoi d'e-mails intégré à Supabase est limité à quelques messages par heure. C'est suffisant pour un foyer. Si ça bloque, branche ton propre SMTP dans **Authentication → SMTP Settings**.
+> Mot de passe oublié : dans **Authentication → Users**, clique sur l'utilisateur pour lui en définir un nouveau.
+
+Dans **Authentication → URL Configuration**, mets aussi l'adresse de ton site GitHub Pages (étape 7) dans **Site URL**.
 
 ### 4. Générer les clés de notification (VAPID)
 
@@ -130,7 +129,7 @@ curl -X POST "https://VOTRE_REF_PROJET.supabase.co/functions/v1/send-reminders?f
 - **iPhone** : ouvre l'URL dans **Safari**, appuie sur **Partager**, puis **Sur l'écran d'accueil**. Ouvre ensuite l'app depuis l'icône, connecte-toi, puis va dans **Réglages → Activer** les rappels. Sur iPhone, les notifications ne fonctionnent que depuis l'app installée (iOS 16.4 ou plus récent).
 - **Android** : ouvre l'URL dans **Chrome**, menu ⋮, puis **Installer l'application**.
 
-Pour partager l'app avec quelqu'un, ajoute son adresse dans `members` (étape 2) et envoie-lui l'URL.
+Pour partager l'app avec quelqu'un, crée son compte (étape 3), ajoute son adresse dans `members` (étape 2), puis envoie-lui l'URL et son mot de passe.
 
 ---
 
