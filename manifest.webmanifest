@@ -1,0 +1,21 @@
+{
+  "name": "Carnet de maison",
+  "short_name": "Maison",
+  "description": "Arrosage des plantes, entretien de la maison et liste de courses du foyer.",
+  "lang": "fr",
+  "start_url": "./?source=pwa",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#F2F4F1",
+  "theme_color": "#2E6A57",
+  "icons": [
+    { "src": "icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "icons/icon-maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ],
+  "shortcuts": [
+    { "name": "Liste de courses", "short_name": "Courses", "url": "./?tab=shop", "icons": [{ "src": "icons/icon-192.png", "sizes": "192x192" }] },
+    { "name": "Plantes", "url": "./?tab=plants", "icons": [{ "src": "icons/icon-192.png", "sizes": "192x192" }] }
+  ]
+}
