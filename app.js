@@ -382,12 +382,17 @@ async function onPhoto(e) {
     useResult(0);
   } catch (err) {
     if (!document.body.contains(st)) return;
-    let code = ""; try { code = (await err.context.json()).error; } catch (e2) { }
+    let code = "", status = "";
+    try { status = err.context && err.context.status ? String(err.context.status) : ""; code = (await err.context.json()).error || ""; } catch (e2) { }
+    const detail = [err.name, status, code].filter(Boolean).join(" · ");
     st.className = "status err";
     st.textContent = code === "quota_exceeded" ? "Limite quotidienne d'identifications atteinte pour ce foyer. Remplis la fiche à la main ou réessaie demain."
       : code === "not_configured" ? "L'identification n'est pas encore configurée sur le serveur (clé Pl@ntNet manquante)."
       : code === "provider_quota" ? "Le service Pl@ntNet a atteint sa limite du jour. Réessaie demain."
+      : code === "forbidden" ? "Accès refusé par le serveur : vérifie que tu es bien membre d'un foyer, puis reconnecte-toi."
+      : err.name === "FunctionsFetchError" ? "Le serveur d'identification est injoignable : vérifie que la fonction s'appelle exactement « identify-plant » et qu'elle est déployée."
       : "L'identification n'a pas abouti. Remplis la fiche à la main ou réessaie avec une autre photo.";
+    if (detail) st.insertAdjacentHTML("beforeend", `<div class="hint" style="margin-top:4px">Détail : ${esc(detail)}</div>`);
     console.error(err);
   }
 }

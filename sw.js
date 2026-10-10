@@ -1,6 +1,6 @@
 // Service worker — cache de l'app pour l'ouverture hors ligne + réception des rappels push.
 // Incrémente VERSION à chaque déploiement pour forcer la mise à jour du cache.
-const VERSION = "maison-v4";
+const VERSION = "maison-v5";
 const SHELL = [
   "./",
   "./index.html",
@@ -15,7 +15,8 @@ const SHELL = [
 ];
 
 self.addEventListener("install", event => {
-  event.waitUntil(caches.open(VERSION).then(c => c.addAll(SHELL)).then(() => self.skipWaiting()));
+  // cache: "reload" : ignore le cache HTTP du navigateur pour récupérer la version réellement publiée
+  event.waitUntil(caches.open(VERSION).then(c => c.addAll(SHELL.map(u => new Request(u, { cache: "reload" })))).then(() => self.skipWaiting()));
 });
 
 self.addEventListener("activate", event => {
@@ -33,16 +34,19 @@ self.addEventListener("fetch", event => {
   // Jamais de cache pour l'API Supabase (données, auth, fonctions)
   if (url.hostname.endsWith(".supabase.co") || url.hostname.endsWith(".supabase.in")) return;
 
-  // Pages : réseau d'abord, cache en secours (hors ligne)
-  if (req.mode === "navigate") {
+  // Fichiers de l'app (même origine) : réseau d'abord pour toujours avoir la dernière version
+  // (config.js compris), cache en secours quand on est hors ligne.
+  if (url.origin === self.location.origin) {
     event.respondWith(
-      fetch(req).then(res => { const copy = res.clone(); caches.open(VERSION).then(c => c.put("./index.html", copy)); return res; })
-        .catch(() => caches.match("./index.html"))
+      fetch(req, { cache: "no-cache" }).then(res => {
+        if (res && res.ok) { const copy = res.clone(); caches.open(VERSION).then(c => c.put(req.mode === "navigate" ? "./index.html" : req, copy)); }
+        return res;
+      }).catch(() => caches.match(req.mode === "navigate" ? "./index.html" : req, { ignoreSearch: true }))
     );
     return;
   }
 
-  // Fichiers de l'app, polices et librairie : cache d'abord, mis à jour en arrière-plan
+  // Polices et librairie (autres origines) : cache d'abord, mis à jour en arrière-plan
   event.respondWith(
     caches.match(req).then(cached => {
       const network = fetch(req).then(res => {
