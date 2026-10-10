@@ -1,6 +1,6 @@
 // Service worker — cache de l'app pour l'ouverture hors ligne + réception des rappels push.
 // Incrémente VERSION à chaque déploiement pour forcer la mise à jour du cache.
-const VERSION = "maison-v3";
+const VERSION = "maison-v4";
 const SHELL = [
   "./",
   "./index.html",
