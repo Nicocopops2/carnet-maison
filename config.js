@@ -11,5 +11,5 @@ window.MAISON_CONFIG = {
   // true une fois la fonction identify-plant déployée avec ta clé Pl@ntNet (voir README)
   plantIdentification: true,
   // true pour afficher « Créer un compte » sur l'écran de connexion (inscription libre)
-  allowSignup: false
+  allowSignup: true
 };
