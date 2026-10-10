@@ -2,7 +2,7 @@ import { createClient } from "https://cdn.jsdelivr.net/npm/@supabase/supabase-js
 
 /* =========================================================
    Carnet de maison — PWA
-   Données : Supabase (tables plants, tasks, groceries ; colonne data jsonb)
+   Données : Supabase (tables plants, tasks, groceries ; colonne data jsonb ; une ligne = un foyer)
    Synchro : realtime + rechargement au retour au premier plan
    Hors ligne : dernière copie en localStorage, écritures nécessitant le réseau
    ========================================================= */
@@ -10,6 +10,8 @@ import { createClient } from "https://cdn.jsdelivr.net/npm/@supabase/supabase-js
 const CFG = window.MAISON_CONFIG || {};
 const CONFIGURED = CFG.supabaseUrl && !CFG.supabaseUrl.includes("VOTRE-PROJET") && CFG.supabaseAnonKey && !CFG.supabaseAnonKey.includes("VOTRE_");
 const sb = CONFIGURED ? createClient(CFG.supabaseUrl, CFG.supabaseAnonKey, { auth: { persistSession: true, autoRefreshToken: true } }) : null;
+const PLANT_ID = CFG.plantIdentification === true;   // identification Pl@ntNet déployée ?
+const ALLOW_SIGNUP = CFG.allowSignup === true;        // inscription libre depuis l'app ?
 
 /* ---------- helpers ---------- */
 const $ = s => document.querySelector(s);
@@ -42,34 +44,41 @@ function dueChip(n, verb) {
   return `<span class="chip num">Le ${shortDate(addDays(todayStr(), n))}</span>`;
 }
 
-/* ---------- storage (Supabase + cache local) ---------- */
+/* ---------- storage (Supabase + cache local, par foyer) ---------- */
 const TABLES = ["plants", "tasks", "groceries"];
 const store = {
+  hid: null,
   cache: { plants: {}, tasks: {}, groceries: {} },
   channel: null,
+  key(t) { return `maison:${this.hid}:${t}`; },
   loadLocal() {
-    TABLES.forEach(t => { try { this.cache[t] = JSON.parse(localStorage.getItem("maison:" + t) || "{}"); } catch (e) { this.cache[t] = {}; } });
+    TABLES.forEach(t => { try { this.cache[t] = JSON.parse(localStorage.getItem(this.key(t)) || "{}"); } catch (e) { this.cache[t] = {}; } });
+    TABLES.forEach(t => { S[t] = this.rows(t); });
   },
-  saveLocal(t) { try { localStorage.setItem("maison:" + t, JSON.stringify(this.cache[t])); } catch (e) { } },
+  saveLocal(t) { try { localStorage.setItem(this.key(t), JSON.stringify(this.cache[t])); } catch (e) { } },
   rows(t) { return Object.entries(this.cache[t]).map(([id, v]) => ({ id, ...v })); },
   emit(t) { this.saveLocal(t); S[t] = this.rows(t); render(); },
   async fetchAll() {
+    const hid = this.hid;
     for (const t of TABLES) {
-      const { data, error } = await sb.from(t).select("id,data");
+      const { data, error } = await sb.from(t).select("id,data").eq("household_id", hid);
       if (error) throw error;
+      if (hid !== this.hid) return;           // foyer changé entre-temps
       this.cache[t] = Object.fromEntries((data || []).map(r => [r.id, r.data]));
       this.emit(t);
     }
   },
+  unsubscribe() { if (this.channel) { sb.removeChannel(this.channel); this.channel = null; } },
   subscribe() {
-    if (this.channel) sb.removeChannel(this.channel);
-    let ch = sb.channel("maison-db");
+    this.unsubscribe();
+    const hid = this.hid;
+    let ch = sb.channel("maison-" + hid);
     TABLES.forEach(t => {
-      ch = ch.on("postgres_changes", { event: "*", schema: "public", table: t }, payload => {
-        if (payload.eventType === "DELETE") { delete this.cache[t][payload.old.id]; }
-        else if (payload.new && payload.new.id) { this.cache[t][payload.new.id] = payload.new.data; }
-        this.emit(t);
-      });
+      // ajouts et modifications : filtrés sur le foyer courant
+      ch = ch.on("postgres_changes", { event: "INSERT", schema: "public", table: t, filter: `household_id=eq.${hid}` }, p => { this.cache[t][p.new.id] = p.new.data; this.emit(t); });
+      ch = ch.on("postgres_changes", { event: "UPDATE", schema: "public", table: t, filter: `household_id=eq.${hid}` }, p => { this.cache[t][p.new.id] = p.new.data; this.emit(t); });
+      // suppressions : non filtrables côté Supabase, on ignore les identifiants inconnus
+      ch = ch.on("postgres_changes", { event: "DELETE", schema: "public", table: t }, p => { if (p.old && this.cache[t][p.old.id]) { delete this.cache[t][p.old.id]; this.emit(t); } });
     });
     this.channel = ch.subscribe(status => setSync(status === "SUBSCRIBED" ? "on" : navigator.onLine ? "wait" : "off"));
   },
@@ -77,7 +86,7 @@ const store = {
     if (!navigator.onLine) throw { code: "offline" };
     const prev = this.cache[t][id];
     this.cache[t][id] = data; this.emit(t);
-    const { error } = await sb.from(t).upsert({ id, data });
+    const { error } = await sb.from(t).upsert({ id, data, household_id: this.hid });
     if (error) { if (prev === undefined) delete this.cache[t][id]; else this.cache[t][id] = prev; this.emit(t); throw error; }
   },
   async update(t, id, patch) {
@@ -102,7 +111,7 @@ function setSync(state) {
 }
 
 /* ---------- state ---------- */
-const S = { tab: "home", plants: [], tasks: [], groceries: [], user: null };
+const S = { tab: "home", plants: [], tasks: [], groceries: [], user: null, household: null, households: [] };
 let armed = null;
 
 function plantInterval(p) { return isWinter() ? (p.waterWinterDays || Math.round((p.waterEveryDays || 7) * 1.5)) : (p.waterEveryDays || 7); }
@@ -259,18 +268,19 @@ function closeSheet() { $("#sheet-root").innerHTML = ""; document.body.style.ove
 
 function plantSheet(p) {
   const isNew = !p; p = p || {};
-  draft = { photo: p.photo || null };
+  draft = { photo: p.photo || null, results: [] };
   const care = !isNew && (p.light || (p.tips && p.tips.length) || p.toxic) ? `<div class="care">
       ${p.light ? `<div><span class="label">Exposition</span><br>${esc(p.light)}</div>` : ""}
       ${p.tips && p.tips.length ? `<div><span class="label">Conseils</span><ul>${p.tips.map(t => `<li>${esc(t)}</li>`).join("")}</ul></div>` : ""}
       ${p.toxic ? `<div><span class="label">Animaux</span><br>${esc(p.toxic)}</div>` : ""}
     </div>` : "";
+  const species = (window.PLANT_CARE && window.PLANT_CARE.LIST) || [];
   openSheet(`
     <div class="sheet-head"><h2>${isNew ? "Nouvelle plante" : esc(p.name)}</h2><button class="icobtn" data-act="close" aria-label="Fermer">${icon("x")}</button></div>
     ${!isNew ? `<button class="btn wide" data-act="water" data-id="${esc(p.id)}" data-close="1">${icon("drop", 16)}Arrosée aujourd'hui</button>` : ""}
     <label class="photo-drop">
       <div class="pv" id="pv">${p.photo ? `<img alt="" src="${esc(p.photo)}">` : icon("cam", 30)}</div>
-      <div><b>${isNew ? "Prendre ou choisir une photo" : "Changer la photo"}</b><span class="hint">La plante est identifiée automatiquement.</span></div>
+      <div><b>${isNew ? "Prendre ou choisir une photo" : "Changer la photo"}</b><span class="hint">${PLANT_ID ? "La plante est identifiée automatiquement." : "La photo illustre la fiche de la plante."}</span></div>
       <input type="file" id="f-photo" accept="image/*">
     </label>
     <div id="id-status" class="status" hidden></div>
@@ -278,7 +288,9 @@ function plantSheet(p) {
     <form id="plant-form" class="view" style="padding:0" data-id="${esc(p.id || "")}">
       <div class="two"><label class="field"><span>Nom</span><input type="text" id="f-name" required value="${esc(p.name || "")}" placeholder="Monstera du salon"></label>
         <label class="field"><span>Pièce</span><select id="f-room">${ROOMS.map(r => `<option ${r === (p.room || "Salon") ? "selected" : ""}>${r}</option>`).join("")}</select></label></div>
-      <label class="field"><span>Espèce</span><input type="text" id="f-species" value="${esc(p.species || "")}" placeholder="Monstera deliciosa"></label>
+      <label class="field"><span>Espèce</span><input type="text" id="f-species" list="species-list" autocomplete="off" value="${esc(p.species || "")}" placeholder="Monstera, basilic, orchidée…"></label>
+      <datalist id="species-list">${species.map(x => `<option value="${esc(x.latin)}">${esc(x.nom)}</option>`).join("")}</datalist>
+      <div id="care-suggest" hidden></div>
       <div class="two"><label class="field"><span>Arroser tous les (jours)</span><input type="number" min="1" max="90" id="f-every" value="${esc(p.waterEveryDays || 7)}"></label>
         <label class="field"><span>En hiver (jours)</span><input type="number" min="1" max="120" id="f-winter" value="${esc(p.waterWinterDays || "")}" placeholder="auto"></label></div>
       <div class="two"><label class="field"><span>Exposition</span><select id="f-light">${LIGHTS.map(l => `<option ${l === (p.light || "Lumière vive indirecte") ? "selected" : ""}>${l}</option>`).join("")}</select></label>
@@ -289,6 +301,28 @@ function plantSheet(p) {
       ${!isNew ? `<button class="btn danger wide" type="button" data-act="del" data-col="plants" data-id="${esc(p.id)}">Supprimer la plante</button>` : ""}
     </form>`);
   $("#f-photo").addEventListener("change", onPhoto);
+  $("#f-species").addEventListener("input", updateCareSuggest);
+  $("#f-name").addEventListener("change", () => { if (!$("#f-species").value) updateCareSuggest(); });
+}
+
+/* Fiches d'entretien intégrées (plant-care.js) */
+function careFor(q) { return window.PLANT_CARE ? (typeof q === "string" ? window.PLANT_CARE.lookupByName(q) : window.PLANT_CARE.lookup(q)) : null; }
+function applyCare(care) {
+  if (!care) return;
+  const set = (id, v) => { const el = $("#" + id); if (el && v != null && v !== "") el.value = v; };
+  set("f-every", care.arrosageJours); set("f-winter", care.arrosageHiverJours);
+  if (LIGHTS.includes(care.exposition)) set("f-light", care.exposition);
+  set("f-tips", (care.conseils || []).join("\n")); set("f-toxic", care.toxiciteAnimaux);
+  if (!$("#f-name").value) set("f-name", care.nom);
+}
+function updateCareSuggest() {
+  const box = $("#care-suggest"); if (!box) return;
+  const care = careFor($("#f-species").value || $("#f-name").value);
+  if (!care) { box.hidden = true; box.innerHTML = ""; return; }
+  box.hidden = false;
+  box.className = "settings-row";
+  box.innerHTML = `<div class="main"><b>Fiche « ${esc(care.nom)} » disponible</b><span class="hint">Arrosage ${esc(every(care.arrosageJours))}, ${esc(care.exposition.toLowerCase())}.</span></div>
+    <button class="btn quiet" type="button" data-act="apply-care">Appliquer</button>`;
 }
 
 async function loadImage(file) {
@@ -302,6 +336,27 @@ function scaled(img, max, q) {
   c.getContext("2d").drawImage(img, 0, 0, c.width, c.height);
   return c.toDataURL("image/jpeg", q);
 }
+const cap = s => s ? s.charAt(0).toUpperCase() + s.slice(1) : s;
+const PLANTNET_CREDIT = `<span class="hint">Identification : <a href="https://plantnet.org" target="_blank" rel="noopener">Pl@ntNet</a></span>`;
+
+function useResult(i) {
+  const r = draft && draft.results && draft.results[i]; if (!r) return;
+  const care = careFor({ species: r.nomLatin, genus: r.genre, family: r.famille });
+  const name = cap(r.nomCommun) || (care && care.nom) || r.nomLatin;
+  $("#f-name").value = name;
+  $("#f-species").value = r.nomLatin || "";
+  if (care) applyCare(care);
+  updateCareSuggest();
+  const conf = r.score >= .5 ? "haute" : r.score >= .2 ? "moyenne" : "faible";
+  const others = draft.results.map((x, j) => ({ x, j })).filter(o => o.j !== i);
+  const st = $("#id-status");
+  st.className = "status ok";
+  st.innerHTML = `Identifiée : <b>${esc(name)}</b> <i>${esc(r.nomLatin || "")}</i> · confiance ${conf} (${Math.round(r.score * 100)} %).
+    ${care ? "Fiche d'entretien appliquée, vérifie-la puis enregistre." : "Pas de fiche connue pour cette espèce : complète l'arrosage à la main."}
+    ${others.length && r.score < .6 ? `<div class="chips" style="margin-top:8px"><span class="hint">Ou peut-être :</span>${others.map(o => `<button type="button" class="fav" data-act="pick-species" data-i="${o.j}">${esc(cap(o.x.nomCommun) || o.x.nomLatin)}</button>`).join("")}</div>` : ""}
+    <div style="margin-top:6px">${PLANTNET_CREDIT}</div>`;
+}
+
 async function onPhoto(e) {
   const file = e.target.files && e.target.files[0]; if (!file) return;
   const st = $("#id-status");
@@ -310,26 +365,29 @@ async function onPhoto(e) {
   catch (err) { st.hidden = false; st.className = "status err"; st.textContent = "Impossible de lire cette image. Essaie une photo JPEG ou PNG."; return; }
   const thumb = scaled(img, 360, .72);
   draft.photo = thumb; $("#pv").innerHTML = `<img alt="" src="${thumb}">`;
-  if (!navigator.onLine) { st.hidden = false; st.className = "status err"; st.textContent = "Hors ligne : l'identification se fera quand tu seras connecté. Tu peux remplir la fiche à la main."; return; }
-  const base64 = scaled(img, 1024, .84).split(",")[1];
+  if (!PLANT_ID) return;
+  if (!navigator.onLine) { st.hidden = false; st.className = "status err"; st.textContent = "Hors ligne : remplis la fiche à la main, ou reprends la photo une fois connecté."; return; }
+  const base64 = scaled(img, 1280, .85).split(",")[1];
   st.hidden = false; st.className = "status"; st.innerHTML = `<span class="spin"></span>Identification de la plante…`;
   try {
-    const { data: r, error } = await sb.functions.invoke("identify-plant", { body: { image: base64 } });
+    const { data, error } = await sb.functions.invoke("identify-plant", { body: { image: base64, household_id: store.hid } });
     if (error) throw error;
     if (!document.body.contains(st)) return;
-    if (!r || !r.nomCommun || r.nomCommun === "Non identifiée") { st.className = "status err"; st.textContent = "Je n'ai pas reconnu de plante sur cette photo. Cadre les feuilles de plus près, ou remplis la fiche à la main."; return; }
-    const set = (id, v) => { const el = $("#" + id); if (el && v != null && v !== "") el.value = v; };
-    if (!$("#f-name").value) set("f-name", r.nomCommun);
-    set("f-species", r.nomLatin); set("f-every", parseInt(r.arrosageJours) || ""); set("f-winter", parseInt(r.arrosageHiverJours) || "");
-    if (LIGHTS.includes(r.exposition)) set("f-light", r.exposition);
-    if (Array.isArray(r.conseils)) set("f-tips", r.conseils.join("\n"));
-    set("f-toxic", r.toxiciteAnimaux);
-    st.className = "status ok";
-    st.innerHTML = `Identifiée : <b>${esc(r.nomCommun)}</b> <i>${esc(r.nomLatin || "")}</i> · confiance ${esc(r.confiance || "?")}. Vérifie la fiche puis enregistre.`;
+    draft.results = (data && data.results) || [];
+    if (!draft.results.length) {
+      st.className = "status err";
+      st.innerHTML = `Aucune espèce reconnue. Photographie une feuille ou une fleur de près, sur fond neutre, ou remplis la fiche à la main.<div style="margin-top:6px">${PLANTNET_CREDIT}</div>`;
+      return;
+    }
+    useResult(0);
   } catch (err) {
     if (!document.body.contains(st)) return;
+    let code = ""; try { code = (await err.context.json()).error; } catch (e2) { }
     st.className = "status err";
-    st.textContent = "L'identification n'a pas abouti. Remplis la fiche à la main ou réessaie avec une autre photo.";
+    st.textContent = code === "quota_exceeded" ? "Limite quotidienne d'identifications atteinte pour ce foyer. Remplis la fiche à la main ou réessaie demain."
+      : code === "not_configured" ? "L'identification n'est pas encore configurée sur le serveur (clé Pl@ntNet manquante)."
+      : code === "provider_quota" ? "Le service Pl@ntNet a atteint sa limite du jour. Réessaie demain."
+      : "L'identification n'a pas abouti. Remplis la fiche à la main ou réessaie avec une autre photo.";
     console.error(err);
   }
 }
@@ -387,13 +445,15 @@ function b64ToUint8(b64) {
 }
 async function pushState() {
   if (!("serviceWorker" in navigator) || !("PushManager" in window) || !("Notification" in window)) return "unsupported";
-  const reg = await navigator.serviceWorker.ready;
+  const reg = await Promise.race([navigator.serviceWorker.ready, new Promise(r => setTimeout(() => r(null), 2500))]);
+  if (!reg) return "unsupported";
   const sub = await reg.pushManager.getSubscription();
   if (sub) return "on";
   return Notification.permission === "denied" ? "denied" : "off";
 }
 async function settingsSheet() {
   const ps = await pushState();
+  const h = S.household || {};
   const pushText = {
     on: ["Rappels activés", "Une notification chaque matin s'il y a des plantes à arroser ou des tâches dues."],
     off: ["Rappels désactivés", "Active-les pour recevoir une notification le matin."],
@@ -404,12 +464,35 @@ async function settingsSheet() {
   }[ps];
   openSheet(`
     <div class="sheet-head"><h2>Réglages</h2><button class="icobtn" data-act="close" aria-label="Fermer">${icon("x")}</button></div>
-    <div class="settings-row"><div class="main"><span class="label">Compte</span><span>${esc(S.user?.email || "")}</span></div></div>
+
+    <span class="label">Foyer</span>
+    ${S.households.length > 1 ? `<label class="field"><span>Foyer affiché</span><select id="hh-switch">${S.households.map(x => `<option value="${esc(x.id)}" ${x.id === h.id ? "selected" : ""}>${esc(x.name)}</option>`).join("")}</select></label>` : ""}
+    <div class="settings-row"><div class="main"><b>${esc(h.name || "")}</b><span class="hint" id="hh-members">Chargement des membres…</span></div></div>
+    <div class="settings-row"><div class="main"><span class="label">Code d'invitation</span>
+        <span class="num" style="font-family:var(--display);font-size:24px;letter-spacing:.18em" id="hh-code">${esc(h.invite_code || "")}</span>
+        <span class="hint">Donne ce code à une personne de ton foyer : elle le saisit après s'être connectée pour partager tes plantes, tâches et courses.</span></div>
+      <button class="btn quiet" data-act="hh-copy">Copier</button></div>
+    <div class="actions">
+      <button class="btn ghost" data-act="hh-regen">Nouveau code</button>
+      <button class="btn ghost" data-act="hh-other">Autre foyer</button>
+    </div>
+    <button class="btn danger wide" data-act="hh-leave">Quitter ce foyer</button>
+
+    <span class="label">Notifications</span>
     <div class="settings-row"><div class="main"><b>${pushText[0]}</b><span class="hint">${pushText[1]}</span></div>
       ${ps === "off" ? `<button class="btn" data-act="push-on">${icon("bell", 16)}Activer</button>` : ps === "on" ? `<button class="btn ghost" data-act="push-off">Désactiver</button>` : ""}</div>
     ${ps === "on" ? `<button class="btn quiet wide" data-act="push-test">Envoyer une notification de test</button>` : ""}
     ${!isStandalone() ? `<div class="settings-row"><div class="main"><b>Installer sur l'écran d'accueil</b><span class="hint">${isIOS() ? "Safari : bouton Partager, puis « Sur l'écran d'accueil »." : "Chrome : menu ⋮, puis « Installer l'application »."}</span></div></div>` : ""}
+
+    <span class="label">Compte</span>
+    <div class="settings-row"><div class="main"><span>${esc(S.user?.email || "")}</span>${PLANT_ID ? `<span class="hint">Identification des plantes par <a href="https://plantnet.org" target="_blank" rel="noopener">Pl@ntNet</a>.</span>` : ""}</div></div>
     <button class="btn danger wide" data-act="logout">Se déconnecter</button>`);
+  const sw = $("#hh-switch"); if (sw) sw.addEventListener("change", () => { closeSheet(); switchHousehold(sw.value); });
+  if (h.id && navigator.onLine) {
+    const { data, error } = await sb.rpc("household_member_list", { h: h.id });
+    const el = $("#hh-members");
+    if (el) el.textContent = error ? "" : (data || []).map(m => m.is_me ? `${m.email} (toi)` : m.email).join(" · ");
+  }
 }
 async function enablePush() {
   try {
@@ -523,6 +606,30 @@ document.addEventListener("click", e => {
       })();
       break;
     }
+    case "apply-care": { applyCare(careFor($("#f-species").value || $("#f-name").value)); toast("Fiche appliquée"); break; }
+    case "pick-species": useResult(+el.dataset.i); break;
+    case "hh-copy": {
+      const code = S.household && S.household.invite_code; if (!code) break;
+      try { navigator.clipboard.writeText(code).then(() => toast("Code copié"), () => toast(`Code : ${code}`)); } catch (err) { toast(`Code : ${code}`); }
+      break;
+    }
+    case "hh-regen": {
+      if (armed !== el) { armed = el; el.textContent = "Confirmer : l'ancien code ne marchera plus"; break; }
+      armed = null;
+      (async () => {
+        const { data: code, error } = await sb.rpc("regenerate_invite", { h: S.household.id });
+        if (error) { toast("Impossible de générer un nouveau code."); return; }
+        S.household.invite_code = code; LS.set("households", S.households);
+        const c = $("#hh-code"); if (c) c.textContent = code;
+        el.textContent = "Nouveau code"; toast("Nouveau code généré");
+      })();
+      break;
+    }
+    case "hh-other": closeSheet(); showOnboarding(true); break;
+    case "hh-leave": {
+      if (armed !== el) { armed = el; el.classList.add("armed"); el.textContent = "Confirmer : quitter ce foyer (supprimé si tu en es le dernier membre)"; break; }
+      armed = null; leaveHousehold(); break;
+    }
     case "push-on": enablePush(); break;
     case "push-off": disablePush(); break;
     case "push-test": testPush(); break;
@@ -539,30 +646,37 @@ document.addEventListener("submit", e => {
   else if (e.target.id === "task-form") saveTask(e.target);
   else if (e.target.id === "g-form") { const i = $("#g-name"); addGrocery(i.value); i.value = ""; i.focus(); }
   else if (e.target.id === "login-form") signIn(e.target);
+  else if (e.target.id === "signup-form") signUp(e.target);
+  else if (e.target.id === "hh-create-form") createHousehold(e.target);
+  else if (e.target.id === "hh-join-form") joinHousehold(e.target);
 });
 document.querySelectorAll("nav.tabs button").forEach(b => b.addEventListener("click", () => setTab(b.dataset.tab)));
 $("#btn-settings").addEventListener("click", settingsSheet);
 
-/* ---------- login (e-mail + mot de passe ; comptes créés dans Supabase > Authentication > Users) ---------- */
+/* ---------- login (e-mail + mot de passe) ---------- */
 let loginEmail = "";
-function showLogin(msg = "") {
+function showLogin(msg = "", mode = "login", info = "") {
   $("#app").hidden = true; $("#login").hidden = false;
   if (!CONFIGURED) {
     $("#login").innerHTML = `<div class="card"><div class="logo">${icon("home", 30)}</div><h1>Configuration requise</h1>
       <p class="hint">Renseigne l'URL et la clé de ton projet Supabase dans <code>config.js</code>, puis redéploie. Le README détaille chaque étape.</p></div>`;
     return;
   }
+  const signup = mode === "signup" && ALLOW_SIGNUP;
   $("#login").innerHTML = `
-    <form class="card" id="login-form">
+    <form class="card" id="${signup ? "signup-form" : "login-form"}">
       <div class="logo">${icon("home", 30)}</div>
-      <h1>Carnet de maison</h1>
-      <p class="hint">Plantes, entretien et courses du foyer.</p>
+      <h1>${signup ? "Créer un compte" : "Carnet de maison"}</h1>
+      <p class="hint">${signup ? "Ensuite, tu pourras créer ton foyer ou rejoindre celui d'un proche." : "Plantes, entretien et courses du foyer."}</p>
       <label class="field"><span>Adresse e-mail</span><input type="email" id="l-email" required autocomplete="username" inputmode="email" value="${esc(loginEmail)}"></label>
-      <label class="field"><span>Mot de passe</span><input type="password" id="l-pass" required autocomplete="current-password"></label>
+      <label class="field"><span>Mot de passe${signup ? " (8 caractères minimum)" : ""}</span><input type="password" id="l-pass" required ${signup ? 'minlength="8" autocomplete="new-password"' : 'autocomplete="current-password"'}></label>
       ${msg ? `<div class="status err">${esc(msg)}</div>` : ""}
-      <button class="btn wide" type="submit">Se connecter</button>
-      <p class="hint">Mot de passe oublié ? La personne qui gère l'app peut le réinitialiser depuis Supabase.</p>
+      ${info ? `<div class="status ok">${esc(info)}</div>` : ""}
+      <button class="btn wide" type="submit">${signup ? "Créer mon compte" : "Se connecter"}</button>
+      ${ALLOW_SIGNUP ? `<button class="btn ghost wide" type="button" id="l-mode">${signup ? "J'ai déjà un compte" : "Créer un compte"}</button>` : ""}
+      ${signup ? "" : `<p class="hint">Mot de passe oublié ? La personne qui gère l'app peut le réinitialiser depuis Supabase.</p>`}
     </form>`;
+  const m = $("#l-mode"); if (m) m.onclick = () => { loginEmail = $("#l-email").value.trim().toLowerCase(); showLogin("", signup ? "login" : "signup"); };
   const first = loginEmail ? $("#l-pass") : $("#l-email"); if (first) first.focus();
 }
 async function signIn(form) {
@@ -570,36 +684,116 @@ async function signIn(form) {
   const password = $("#l-pass").value;
   const btn = form.querySelector("button[type=submit]"); btn.disabled = true; btn.textContent = "Connexion…";
   const { error } = await sb.auth.signInWithPassword({ email: loginEmail, password });
-  if (error) showLogin(error.status === 429 ? "Trop de tentatives. Patiente une minute." : !navigator.onLine ? "Pas de connexion internet." : "E-mail ou mot de passe incorrect.");
+  if (error) showLogin(error.status === 429 ? "Trop de tentatives. Patiente une minute." : !navigator.onLine ? "Pas de connexion internet."
+    : /confirm/i.test(error.message || "") ? "Adresse pas encore confirmée : clique sur le lien reçu par e-mail." : "E-mail ou mot de passe incorrect.");
+}
+async function signUp(form) {
+  loginEmail = $("#l-email").value.trim().toLowerCase();
+  const password = $("#l-pass").value;
+  const btn = form.querySelector("button[type=submit]"); btn.disabled = true; btn.textContent = "Création…";
+  const { data, error } = await sb.auth.signUp({ email: loginEmail, password, options: { emailRedirectTo: location.origin + location.pathname } });
+  if (error) { showLogin(/registered|exists/i.test(error.message || "") ? "Un compte existe déjà avec cette adresse." : /signups? not allowed|disabled/i.test(error.message || "") ? "La création de compte est désactivée. Demande à la personne qui gère l'app." : "La création du compte a échoué. Réessaie.", "signup"); return; }
+  if (data.user && Array.isArray(data.user.identities) && data.user.identities.length === 0) { showLogin("Un compte existe déjà avec cette adresse.", "login"); return; }
+  if (!data.session) showLogin("", "login", "Compte créé. Confirme ton adresse avec le lien reçu par e-mail, puis connecte-toi ici.");
+  // sinon : onAuthStateChange prend le relais
+}
+
+/* ---------- foyers ---------- */
+const LS = {
+  get(k) { try { return JSON.parse(localStorage.getItem("maison:" + k)); } catch (e) { return null; } },
+  set(k, v) { try { localStorage.setItem("maison:" + k, JSON.stringify(v)); } catch (e) { } }
+};
+async function loadHouseholds() {
+  const { data, error } = await sb.from("households").select("id,name,invite_code,created_at").order("created_at");
+  if (error) throw error;
+  S.households = data || []; LS.set("households", S.households);
+  return S.households;
+}
+function showApp() {
+  $("#login").hidden = true; $("#app").hidden = false;
+  try { const t = localStorage.getItem("maison:tab"); if (t && TITLES[t]) setTab(t); } catch (e) { }
+}
+function switchHousehold(id) {
+  const h = S.households.find(x => x.id === id) || S.households[0]; if (!h) return;
+  S.household = h; LS.set("hid", h.id);
+  store.unsubscribe(); store.hid = h.id; store.loadLocal();
+  $("#today-label").textContent = new Date().toLocaleDateString("fr-FR", { weekday: "long", day: "numeric", month: "long" }) + " · " + h.name;
+  showApp(); render();
+  if (navigator.onLine) {
+    store.fetchAll().catch(() => toast("Chargement impossible. Les données affichées peuvent dater."));
+    store.subscribe();
+  } else setSync("off");
+}
+function showOnboarding(canCancel = false, msg = "") {
+  $("#app").hidden = true; $("#login").hidden = false;
+  $("#login").innerHTML = `<div class="card">
+      <div class="logo">${icon("home", 30)}</div>
+      <h1>${canCancel ? "Autre foyer" : "Bienvenue !"}</h1>
+      <p class="hint">Crée le foyer de ta maison, ou rejoins celui d'un proche avec son code d'invitation. Chaque foyer a ses propres plantes, tâches et courses.</p>
+      <form id="hh-create-form" class="view" style="padding:0">
+        <label class="field"><span>Nom du foyer</span><input type="text" id="hh-name" required maxlength="60" placeholder="Appart de Lyon"></label>
+        <button class="btn wide" type="submit">Créer le foyer</button>
+      </form>
+      <div class="label" style="text-align:center">ou</div>
+      <form id="hh-join-form" class="view" style="padding:0">
+        <label class="field"><span>Code d'invitation</span><input type="text" id="hh-code-in" class="code-input" required maxlength="8" autocapitalize="characters" autocomplete="off" placeholder="ABC234"></label>
+        <button class="btn ghost wide" type="submit">Rejoindre ce foyer</button>
+      </form>
+      ${msg ? `<div class="status err">${esc(msg)}</div>` : ""}
+      <button class="btn quiet wide" type="button" id="hh-back">${canCancel ? "Retour" : "Se déconnecter"}</button>
+    </div>`;
+  $("#hh-back").onclick = () => canCancel ? showApp() : sb.auth.signOut();
+}
+async function createHousehold(form) {
+  const name = $("#hh-name").value.trim(); if (!name) return;
+  const btn = form.querySelector("button[type=submit]"); btn.disabled = true; btn.textContent = "Création…";
+  const { data: id, error } = await sb.rpc("create_household", { p_name: name });
+  if (error) { showOnboarding(!!S.households.length, "La création du foyer a échoué. Vérifie ta connexion et réessaie."); return; }
+  await loadHouseholds().catch(() => { });
+  switchHousehold(id); toast(`Foyer « ${name} » créé`);
+}
+async function joinHousehold(form) {
+  const code = $("#hh-code-in").value;
+  const btn = form.querySelector("button[type=submit]"); btn.disabled = true; btn.textContent = "Vérification…";
+  const { data: id, error } = await sb.rpc("join_household", { p_code: code });
+  if (error) { showOnboarding(!!S.households.length, /invalid_code/.test(error.message || "") ? "Code inconnu. Vérifie-le auprès de la personne qui t'invite (il change si elle en génère un nouveau)." : "Impossible de rejoindre ce foyer. Vérifie ta connexion."); return; }
+  await loadHouseholds().catch(() => { });
+  switchHousehold(id); toast(`Bienvenue dans « ${S.household.name} »`);
+}
+async function leaveHousehold() {
+  const h = S.household; if (!h) return;
+  const { error } = await sb.rpc("leave_household", { h: h.id });
+  if (error) { toast("Impossible de quitter le foyer pour l'instant."); return; }
+  ["plants", "tasks", "groceries"].forEach(t => { try { localStorage.removeItem(`maison:${h.id}:${t}`); } catch (e) { } });
+  closeSheet();
+  await loadHouseholds().catch(() => { S.households = S.households.filter(x => x.id !== h.id); });
+  store.unsubscribe(); store.hid = null; S.household = null;
+  if (S.households.length) { switchHousehold(S.households[0].id); toast(`Tu as quitté « ${h.name} »`); }
+  else showOnboarding(false);
 }
 
 /* ---------- boot ---------- */
 async function startApp(user) {
   S.user = user;
-  const { data: isMember, error } = await sb.rpc("is_member");
-  if (error && navigator.onLine) { console.error(error); }
-  if (navigator.onLine && !error && !isMember) {
-    $("#app").hidden = true; $("#login").hidden = false;
-    $("#login").innerHTML = `<div class="card"><div class="logo">${icon("home", 30)}</div><h1>Accès non autorisé</h1>
-      <p class="hint">Le compte <b>${esc(user.email)}</b> ne fait pas partie de ce foyer. Demande à la personne qui gère l'app d'ajouter ton adresse.</p>
-      <button class="btn ghost wide" id="l-out">Utiliser une autre adresse</button></div>`;
-    $("#l-out").onclick = () => sb.auth.signOut();
-    return;
-  }
-  $("#login").hidden = true; $("#app").hidden = false;
-  try { const t = localStorage.getItem("maison:tab"); if (t && TITLES[t]) setTab(t); } catch (e) { }
-  store.loadLocal(); TABLES.forEach(t => S[t] = store.rows(t)); render();
+  S.households = LS.get("households") || [];
   if (navigator.onLine) {
-    try { await store.fetchAll(); } catch (e) { toast("Chargement impossible. Les données affichées peuvent dater."); }
-    store.subscribe();
-  } else setSync("off");
+    try { await loadHouseholds(); }
+    catch (e) { console.error(e); if (!S.households.length) { showOnboarding(false, "Impossible de charger tes foyers. Vérifie ta connexion, puis recharge l'app."); return; } }
+  }
+  if (!S.households.length) { showOnboarding(false); return; }
+  const wanted = new URLSearchParams(location.search).get("foyer") || LS.get("hid");
+  switchHousehold(wanted);
 }
 
 $("#today-label").textContent = new Date().toLocaleDateString("fr-FR", { weekday: "long", day: "numeric", month: "long" });
 
 if ("serviceWorker" in navigator) {
   navigator.serviceWorker.register("./sw.js").catch(err => console.warn("SW", err));
-  navigator.serviceWorker.addEventListener("message", e => { if (e.data && e.data.tab && TITLES[e.data.tab]) setTab(e.data.tab); });
+  navigator.serviceWorker.addEventListener("message", e => {
+    const d = e.data || {};
+    if (d.foyer && d.foyer !== store.hid && S.households.some(x => x.id === d.foyer)) switchHousehold(d.foyer);
+    if (d.tab && TITLES[d.tab]) setTab(d.tab);
+  });
 }
 
 if (!CONFIGURED) showLogin();
@@ -609,16 +803,19 @@ else {
     // setTimeout : ne pas appeler d'autres méthodes Supabase directement dans ce callback (risque de blocage côté supabase-js)
     if (session && session.user && !started) { started = true; setTimeout(() => startApp(session.user), 0); }
     if (!session && event === "SIGNED_OUT") {
-      started = false; S.user = null;
-      if (store.channel) { sb.removeChannel(store.channel); store.channel = null; } TABLES.forEach(t => { try { localStorage.removeItem("maison:" + t); } catch (e) { } }); showLogin(); }
+      started = false; S.user = null; S.household = null; S.households = [];
+      store.unsubscribe(); store.hid = null;
+      try { Object.keys(localStorage).filter(k => k.startsWith("maison:") && k !== "maison:tab").forEach(k => localStorage.removeItem(k)); } catch (e) { }
+      showLogin();
+    }
   });
   sb.auth.getSession().then(({ data }) => { if (!data.session) showLogin(); });
 }
 
-window.addEventListener("online", () => { if (S.user) { store.fetchAll().catch(() => { }); store.subscribe(); } });
+window.addEventListener("online", () => { if (S.user && store.hid) { store.fetchAll().catch(() => { }); store.subscribe(); } });
 window.addEventListener("offline", () => setSync("off"));
 document.addEventListener("visibilitychange", () => {
-  if (document.visibilityState === "visible" && S.user && navigator.onLine) { store.fetchAll().catch(() => { }); render(); }
+  if (document.visibilityState === "visible" && S.user && store.hid && navigator.onLine) { store.fetchAll().catch(() => { }); render(); }
 });
 setInterval(() => { const d = todayStr(); if (d !== window.__d) { window.__d = d; render(); } }, 60000); window.__d = todayStr();
 // URL ?tab=courses depuis une notification ou un raccourci

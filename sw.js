@@ -1,12 +1,13 @@
 // Service worker — cache de l'app pour l'ouverture hors ligne + réception des rappels push.
 // Incrémente VERSION à chaque déploiement pour forcer la mise à jour du cache.
-const VERSION = "maison-v2";
+const VERSION = "maison-v3";
 const SHELL = [
   "./",
   "./index.html",
   "./styles.css",
   "./app.js",
   "./config.js",
+  "./plant-care.js",
   "./manifest.webmanifest",
   "./icons/icon-192.png",
   "./icons/icon-512.png",
@@ -80,8 +81,8 @@ self.addEventListener("notificationclick", event => {
     for (const c of all) {
       if (c.url.startsWith(self.registration.scope)) {
         await c.focus();
-        const tab = new URL(target).searchParams.get("tab");
-        if (tab) c.postMessage({ tab });
+        const params = new URL(target).searchParams;
+        c.postMessage({ tab: params.get("tab"), foyer: params.get("foyer") });
         return;
       }
     }

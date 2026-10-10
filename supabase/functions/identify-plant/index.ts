@@ -1,6 +1,9 @@
-// Edge Function : identification d'une plante à partir d'une photo, via l'API Claude.
-// Secrets requis : ANTHROPIC_API_KEY (et optionnellement ANTHROPIC_MODEL).
-// Seuls les membres du foyer connectés peuvent l'appeler.
+// Edge Function : identification d'une plante à partir d'une photo, via l'API Pl@ntNet (gratuite).
+// https://my.plantnet.org — offre gratuite : 500 identifications par jour, mention de Pl@ntNet requise.
+// Secret requis : PLANTNET_API_KEY.
+// Accès : utilisateur connecté et membre du foyer indiqué, dans la limite du quota quotidien du foyer
+// (voir consume_identify_quota dans schema.sql).
+// À déployer avec la vérification JWT désactivée : la fonction contrôle elle-même l'accès.
 import { createClient } from "jsr:@supabase/supabase-js@2";
 
 const CORS = {
@@ -11,62 +14,55 @@ const CORS = {
 const json = (body: unknown, status = 200) =>
   new Response(JSON.stringify(body), { status, headers: { ...CORS, "Content-Type": "application/json" } });
 
-const PROMPT = `Tu es un botaniste spécialiste des plantes d'intérieur et de balcon en France. La photo montre une plante ou une fleur prise par un particulier chez lui.
-Identifie-la et propose une fiche d'entretien pratique. Réponds UNIQUEMENT avec un objet JSON, en français, sans texte autour, de cette forme :
-{"nomCommun": string, "nomLatin": string, "confiance": "haute"|"moyenne"|"faible", "arrosageJours": entier (intervalle entre deux arrosages au printemps/été en intérieur), "arrosageHiverJours": entier, "exposition": "Plein soleil"|"Lumière vive indirecte"|"Mi-ombre"|"Ombre", "conseils": [3 à 4 phrases courtes et concrètes : signe qu'il faut arroser, rempotage, engrais, erreur fréquente], "toxiciteAnimaux": phrase courte (chats/chiens)}
-Si la photo ne montre pas de plante, mets "confiance": "faible" et "nomCommun": "Non identifiée".`;
-
 Deno.serve(async (req) => {
   if (req.method === "OPTIONS") return new Response("ok", { headers: CORS });
   if (req.method !== "POST") return json({ error: "method_not_allowed" }, 405);
 
-  // 1. Vérifier que l'appelant est un membre du foyer
-  const auth = req.headers.get("Authorization") ?? "";
-  const sb = createClient(Deno.env.get("SUPABASE_URL")!, Deno.env.get("SUPABASE_ANON_KEY")!, {
-    global: { headers: { Authorization: auth } },
-  });
-  const { data: isMember, error: memberErr } = await sb.rpc("is_member");
-  if (memberErr || !isMember) return json({ error: "forbidden" }, 403);
-
-  // 2. Lire l'image (base64 JPEG, sans préfixe data:)
-  let image = "";
-  try { ({ image } = await req.json()); } catch { /* corps invalide */ }
+  let image = "", household_id = "";
+  try { ({ image, household_id } = await req.json()); } catch { /* corps invalide */ }
   if (!image || typeof image !== "string") return json({ error: "image_missing" }, 400);
+  if (!household_id) return json({ error: "household_missing" }, 400);
   if (image.length > 7_000_000) return json({ error: "image_too_large" }, 413);
 
-  // 3. Appeler Claude
-  const apiKey = Deno.env.get("ANTHROPIC_API_KEY");
-  if (!apiKey) return json({ error: "server_not_configured" }, 500);
-  const res = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: {
-      "x-api-key": apiKey,
-      "anthropic-version": "2023-06-01",
-      "content-type": "application/json",
-    },
-    body: JSON.stringify({
-      model: Deno.env.get("ANTHROPIC_MODEL") ?? "claude-sonnet-5-5",
-      max_tokens: 800,
-      messages: [{
-        role: "user",
-        content: [
-          { type: "image", source: { type: "base64", media_type: "image/jpeg", data: image } },
-          { type: "text", text: PROMPT },
-        ],
-      }],
-    }),
-  });
+  // 1. Appelant connecté + membre du foyer + quota du jour (vérifié par la base, avec le jeton de l'utilisateur)
+  const auth = req.headers.get("Authorization") ?? "";
+  const publicKey = Deno.env.get("SUPABASE_ANON_KEY") ?? req.headers.get("apikey") ?? "";
+  const sb = createClient(Deno.env.get("SUPABASE_URL")!, publicKey, { global: { headers: { Authorization: auth } } });
+  const { data: allowed, error: quotaErr } = await sb.rpc("consume_identify_quota", { h: household_id });
+  if (quotaErr) return json({ error: "forbidden" }, 403);
+  if (!allowed) return json({ error: "quota_exceeded" }, 429);
+
+  // 2. Appel Pl@ntNet
+  const key = Deno.env.get("PLANTNET_API_KEY");
+  if (!key) return json({ error: "not_configured" }, 500);
+
+  const bytes = Uint8Array.from(atob(image), (c) => c.charCodeAt(0));
+  const form = new FormData();
+  form.append("images", new Blob([bytes], { type: "image/jpeg" }), "photo.jpg");
+  form.append("organs", "auto");
+
+  const url = new URL("https://my-api.plantnet.org/v2/identify/all");
+  url.searchParams.set("api-key", key);
+  url.searchParams.set("lang", "fr");
+  url.searchParams.set("nb-results", "3");
+  url.searchParams.set("include-related-images", "false");
+
+  const res = await fetch(url, { method: "POST", body: form });
+  if (res.status === 404) return json({ results: [] });            // aucune espèce reconnue
+  if (res.status === 429) return json({ error: "provider_quota" }, 429);
   if (!res.ok) {
-    console.error("Claude API", res.status, await res.text());
+    console.error("Pl@ntNet", res.status, await res.text());
     return json({ error: "identification_failed" }, 502);
   }
+
   const out = await res.json();
-  const text: string = (out.content ?? []).filter((b: { type: string }) => b.type === "text").map((b: { text: string }) => b.text).join("");
-  const match = text.match(/\{[\s\S]*\}/);
-  if (!match) return json({ error: "unparseable_answer" }, 502);
-  try {
-    return json(JSON.parse(match[0]));
-  } catch {
-    return json({ error: "unparseable_answer" }, 502);
-  }
+  // deno-lint-ignore no-explicit-any
+  const results = (out.results ?? []).slice(0, 3).map((r: any) => ({
+    score: r.score,
+    nomLatin: r.species?.scientificNameWithoutAuthor ?? null,
+    genre: r.species?.genus?.scientificNameWithoutAuthor ?? null,
+    famille: r.species?.family?.scientificNameWithoutAuthor ?? null,
+    nomCommun: (r.species?.commonNames ?? [])[0] ?? null,
+  }));
+  return json({ results });
 });
