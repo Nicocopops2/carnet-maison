@@ -126,11 +126,11 @@ textarea{resize:vertical;min-height:72px}
 
 /* nav */
 nav.tabs{position:fixed;left:0;right:0;bottom:0;z-index:10;background:var(--surface);border-top:1px solid var(--line);padding:6px 8px calc(6px + env(safe-area-inset-bottom,0px));display:flex;justify-content:center}
-nav.tabs .in{display:grid;grid-template-columns:repeat(4,1fr);width:100%;max-width:640px}
-nav.tabs button{border:0;background:transparent;display:flex;flex-direction:column;align-items:center;gap:2px;padding:6px 2px;font-size:11.5px;font-weight:600;color:var(--muted);border-radius:12px;position:relative}
+nav.tabs .in{display:grid;grid-template-columns:repeat(5,1fr);width:100%;max-width:640px}
+nav.tabs button{border:0;background:transparent;display:flex;flex-direction:column;align-items:center;gap:2px;padding:6px 0;font-size:11px;white-space:nowrap;font-weight:600;color:var(--muted);border-radius:12px;position:relative}
 nav.tabs button[aria-selected="true"]{color:var(--accent)}
 nav.tabs button[aria-selected="true"] svg{background:var(--accent-soft)}
-nav.tabs svg{width:44px;height:28px;padding:3px 10px;border-radius:999px}
+nav.tabs svg{width:42px;height:28px;padding:3px 9px;border-radius:999px}
 .badge{position:absolute;top:2px;left:calc(50% + 8px);min-width:18px;height:18px;border-radius:9px;background:var(--late);color:#fff;font-size:11px;display:grid;place-items:center;padding:0 5px}
 
 /* sheet */
@@ -180,3 +180,38 @@ header.top{padding-top:calc(18px + env(safe-area-inset-top,0px));top:0}
 .settings-row{display:flex;justify-content:space-between;align-items:center;gap:12px;background:var(--surface);border-radius:var(--r);padding:12px 14px}
 .settings-row .main{min-width:0;display:flex;flex-direction:column;gap:2px}
 @media (max-width:400px){#sync-label{display:none}}
+
+/* ---------- v6 : cases à cocher, raccourcis, to-do, tri ---------- */
+.trow{grid-template-columns:auto 1fr auto}
+.trow:not(:has(.ico)){grid-template-columns:auto 1fr}
+.rowbtn{border:0;background:transparent;text-align:left;padding:0;cursor:pointer;color:inherit;font:inherit;min-width:0}
+.rowbtn .title{display:block;font-weight:600;overflow-wrap:anywhere}
+.rowbtn .meta{display:flex;flex-wrap:wrap;gap:4px 8px;align-items:center;font-size:12.5px;color:var(--muted)}
+.row .ico.sm{width:36px;height:36px;border-radius:10px}
+.tick{width:32px;height:32px;border-radius:50%;border:2px solid var(--line);background:var(--surface);color:transparent;display:grid;place-items:center;flex:none;padding:0;transition:background .15s,border-color .15s}
+.tick:hover{border-color:var(--accent)}
+.tick.on{background:var(--accent);border-color:var(--accent);color:var(--accent-ink)}
+.isdone .title{text-decoration:line-through;color:var(--muted)}
+#v-todo .kind{display:none}
+.kind{display:inline-flex;align-items:center;gap:3px;color:var(--accent);font-weight:600}
+.trunc{max-width:14em;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.muted-h{color:var(--muted)}
+.late-h{color:var(--late)}
+.shortcuts{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px}
+.sc{border:0;background:var(--surface);box-shadow:var(--shadow);border-radius:var(--r);padding:12px 4px 10px;display:flex;flex-direction:column;align-items:center;gap:6px;color:var(--accent);font-size:12.5px;font-weight:600}
+.sc span{color:var(--ink)}
+.sc:hover{background:var(--accent-soft)}
+.sc svg{width:30px;height:30px;padding:4px;border-radius:10px;background:var(--accent-soft)}
+.seg{display:inline-flex;background:var(--surface);border:1px solid var(--line);border-radius:999px;padding:3px;gap:2px}
+.seg button{border:0;background:transparent;border-radius:999px;padding:6px 12px;font-size:13px;font-weight:600;color:var(--muted)}
+.seg button[aria-pressed="true"]{background:var(--accent-soft);color:var(--accent)}
+.room-h h2{font-size:16px}
+.fav.sel{background:var(--accent);border-color:var(--accent);color:var(--accent-ink)}
+.chipdate{width:auto!important;padding:5px 10px!important;font-size:14px!important;border-radius:999px!important}
+.done-box{display:flex;flex-direction:column;gap:10px}
+.done-box summary{display:flex;justify-content:space-between;align-items:center;cursor:pointer;font-family:var(--display);font-weight:700;font-size:17px;color:var(--muted);padding:4px 0;list-style:none}
+.done-box summary::-webkit-details-marker{display:none}
+.done-box summary::after{content:"▾";font-size:14px;margin-left:8px}
+.done-box[open] summary::after{content:"▴"}
+.done-box[open] > .list{margin-bottom:10px}
+.water.on{background:var(--accent);color:var(--accent-ink)}

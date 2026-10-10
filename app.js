@@ -45,7 +45,7 @@ function dueChip(n, verb) {
 }
 
 /* ---------- storage (Supabase + cache local, par foyer) ---------- */
-const TABLES = ["plants", "tasks", "groceries"];
+const TABLES = ["plants", "tasks", "todos", "groceries"];
 const store = {
   hid: null,
   cache: { plants: {}, tasks: {}, groceries: {} },
@@ -111,12 +111,70 @@ function setSync(state) {
 }
 
 /* ---------- state ---------- */
-const S = { tab: "home", plants: [], tasks: [], groceries: [], user: null, household: null, households: [] };
+const S = { tab: "home", plants: [], tasks: [], groceries: [], todos: [], user: null, household: null, households: [], todoDue: "none" };
 let armed = null;
 
 function plantInterval(p) { return isWinter() ? (p.waterWinterDays || Math.round((p.waterEveryDays || 7) * 1.5)) : (p.waterEveryDays || 7); }
 function plantDue(p) { const last = p.lastWatered || todayStr(); return diffDays(todayStr(), addDays(last, plantInterval(p))); }
 function taskDue(t) { const last = t.lastDone || todayStr(); return diffDays(todayStr(), addDays(last, t.everyDays || 30)); }
+function todoDue(t) { return t.due ? diffDays(todayStr(), t.due) : null; }   // null = sans date
+const doneToday = d => !!d && d.slice(0, 10) === todayStr();
+
+/* Ce qui est à faire aujourd'hui (en retard compris) */
+function todayItems() {
+  return [
+    ...S.plants.filter(p => plantDue(p) <= 0).map(o => ({ kind: "plant", o, n: plantDue(o) })),
+    ...S.tasks.filter(t => taskDue(t) <= 0).map(o => ({ kind: "task", o, n: taskDue(o) })),
+    ...S.todos.filter(t => !t.done && t.due && todoDue(t) <= 0).map(o => ({ kind: "todo", o, n: todoDue(o) }))
+  ].sort((a, b) => a.n - b.n);
+}
+function doneTodayItems() {
+  return [
+    ...S.plants.filter(p => p.lastWatered === todayStr()).map(o => ({ kind: "plant", o })),
+    ...S.tasks.filter(t => t.lastDone === todayStr()).map(o => ({ kind: "task", o })),
+    ...S.todos.filter(t => t.done && doneToday(t.doneAt)).map(o => ({ kind: "todo", o }))
+  ];
+}
+
+/* Cocher / décocher, même geste partout */
+function tick(kind, id) {
+  const today = todayStr();
+  if (kind === "plant") {
+    const p = S.plants.find(x => x.id === id); if (!p) return;
+    if (p.lastWatered === today) {
+      let back = p.prevWatered && p.prevWatered !== today ? p.prevWatered : addDays(today, -plantInterval(p));
+      guard(store.update("plants", id, { lastWatered: back }));
+      toast(`${p.name} : remis à arroser`);
+    } else {
+      const before = p.lastWatered;
+      guard(store.update("plants", id, { lastWatered: today, prevWatered: before || null }));
+      toast(`${p.name} arrosée · prochaine fois le ${shortDate(addDays(today, plantInterval(p)))}`, () => guard(store.update("plants", id, { lastWatered: before })));
+    }
+  } else if (kind === "task") {
+    const t = S.tasks.find(x => x.id === id); if (!t) return;
+    const every = t.everyDays || 30;
+    if (taskDue(t) > 0) {
+      // déjà à jour → remettre à faire
+      const history = [...(t.history || [])];
+      let back;
+      if (t.lastDone === today) { if (history[history.length - 1] === today) history.pop(); back = t.prevDone && t.prevDone !== today ? t.prevDone : null; }
+      if (!back || diffDays(today, addDays(back, every)) > 0) back = addDays(today, -every);
+      const before = { lastDone: t.lastDone, history: t.history || [] };
+      guard(store.update("tasks", id, { lastDone: back, history }));
+      toast(`« ${t.title} » remis à faire`, () => guard(store.update("tasks", id, before)));
+    } else {
+      const before = { lastDone: t.lastDone, history: t.history || [], prevDone: t.prevDone || null };
+      const history = [...(t.history || []).filter(d => d !== today), today].slice(-12);
+      guard(store.update("tasks", id, { lastDone: today, prevDone: t.lastDone || null, history }));
+      toast(`Fait · prochaine fois le ${shortDate(addDays(today, every))}`, () => guard(store.update("tasks", id, before)));
+    }
+  } else if (kind === "todo") {
+    const t = S.todos.find(x => x.id === id); if (!t) return;
+    const done = !t.done;
+    guard(store.update("todos", id, { done, doneAt: done ? new Date().toISOString() : null }));
+    toast(done ? "C'est fait !" : `« ${t.title} » remis à faire`, () => guard(store.update("todos", id, { done: t.done, doneAt: t.doneAt || null })));
+  }
+}
 
 /* ---------- aisles ---------- */
 const AISLES = [
@@ -154,77 +212,186 @@ const LIGHTS = ["Plein soleil", "Lumière vive indirecte", "Mi-ombre", "Ombre"];
 /* ---------- render ---------- */
 function render() {
   if ($("#app").hidden) return;
-  renderHome(); renderPlants(); renderTasks(); renderShop();
-  const dueCount = S.plants.filter(p => plantDue(p) <= 0).length + S.tasks.filter(t => taskDue(t) <= 0).length;
+  renderHome(); renderPlants(); renderTasks(); renderTodos(); renderShop();
+  const dueCount = todayItems().length;
   const b = $("#badge-home"); b.textContent = dueCount; b.hidden = dueCount === 0;
   if ("setAppBadge" in navigator) { (dueCount ? navigator.setAppBadge(dueCount) : navigator.clearAppBadge()).catch(() => { }); }
 }
 
-function plantRow(p) {
-  const n = plantDue(p);
-  return `<div class="row tap" data-act="open-plant" data-id="${esc(p.id)}">
-    <div class="ico">${p.photo ? `<img alt="" src="${esc(p.photo)}">` : icon("leaf")}</div>
-    <div class="main"><div class="title">${esc(p.name || "Plante")}</div>
-      <div class="meta">${dueChip(n, "Arroser")}<span>${esc(p.room || "")}</span></div></div>
-    <button class="btn quiet" data-act="water" data-id="${esc(p.id)}">${icon("drop", 16)}Arrosée</button>
-  </div>`;
+const tickBtn = (kind, id, on, label) =>
+  `<button class="tick${on ? " on" : ""}" data-act="tick" data-kind="${kind}" data-id="${esc(id)}" aria-pressed="${on}" aria-label="${esc(label)}">${icon("check", 18)}</button>`;
+
+function lateChip(n, todayLabel = "Aujourd'hui") {
+  if (n == null) return "";
+  if (n < 0) return `<span class="chip late num">En retard · ${-n} j</span>`;
+  if (n === 0) return `<span class="chip soon">${todayLabel}</span>`;
+  if (n === 1) return `<span class="chip">Demain</span>`;
+  return `<span class="chip num">${n <= 6 ? new Date(toUTC(addDays(todayStr(), n))).toLocaleDateString("fr-FR", { weekday: "long", timeZone: "UTC" }) : "Le " + shortDate(addDays(todayStr(), n))}</span>`;
 }
-function taskRow(t) {
-  const n = taskDue(t);
-  return `<div class="row tap" data-act="open-task" data-id="${esc(t.id)}">
-    <div class="ico">${icon("tool")}</div>
-    <div class="main"><div class="title">${esc(t.title)}</div>
-      <div class="meta">${dueChip(n, "À faire")}<span>${esc(every(t.everyDays || 30))}</span></div></div>
-    <button class="btn quiet" data-act="done" data-id="${esc(t.id)}">${icon("check", 16)}Fait</button>
-  </div>`;
+
+/* Une ligne générique : case à cocher + contenu (ouvre la fiche) */
+function itemRow(it, on) {
+  const o = it.o;
+  if (it.kind === "plant") return `<div class="row trow${on ? " isdone" : ""}">
+      ${tickBtn("plant", o.id, on, on ? `Remettre ${o.name} à arroser` : `${o.name} arrosée`)}
+      <button class="main rowbtn" data-act="open-plant" data-id="${esc(o.id)}"><span class="title">Arroser ${esc(o.name || "la plante")}</span>
+        <span class="meta"><span class="kind">${icon("leaf", 13)}Plante</span>${on ? "" : lateChip(it.n)}${o.room ? `<span>${esc(o.room)}</span>` : ""}</span></button>
+      <div class="ico sm">${o.photo ? `<img alt="" src="${esc(o.photo)}">` : icon("drop", 18)}</div></div>`;
+  if (it.kind === "task") return `<div class="row trow${on ? " isdone" : ""}">
+      ${tickBtn("task", o.id, on, on ? `Remettre « ${o.title} » à faire` : `« ${o.title} » fait`)}
+      <button class="main rowbtn" data-act="open-task" data-id="${esc(o.id)}"><span class="title">${esc(o.title)}</span>
+        <span class="meta"><span class="kind">${icon("tool", 13)}Entretien</span>${on ? "" : lateChip(it.n)}${o.room ? `<span>${esc(o.room)}</span>` : ""}</span></button></div>`;
+  return `<div class="row trow${on ? " isdone" : ""}">
+      ${tickBtn("todo", o.id, on, on ? `Remettre « ${o.title} » à faire` : `« ${o.title} » fait`)}
+      <button class="main rowbtn" data-act="open-todo" data-id="${esc(o.id)}"><span class="title">${esc(o.title)}</span>
+        <span class="meta"><span class="kind">${icon("list", 13)}To-do</span>${on ? "" : lateChip(it.n)}${o.notes ? `<span class="trunc">${esc(o.notes)}</span>` : ""}</span></button></div>`;
 }
 
 function renderHome() {
-  const plantsNow = S.plants.filter(p => plantDue(p) <= 0).sort((a, b) => plantDue(a) - plantDue(b));
-  const tasksNow = S.tasks.filter(t => taskDue(t) <= 0).sort((a, b) => taskDue(a) - taskDue(b));
-  const soon = [
-    ...S.plants.filter(p => { const n = plantDue(p); return n > 0 && n <= 7; }).map(p => ({ k: "p", n: plantDue(p), o: p })),
-    ...S.tasks.filter(t => { const n = taskDue(t); return n > 0 && n <= 7; }).map(t => ({ k: "t", n: taskDue(t), o: t }))
-  ].sort((a, b) => a.n - b.n);
-  const inList = S.groceries.filter(g => g.inList);
-  const now = [...plantsNow.map(plantRow), ...tasksNow.map(taskRow)];
+  const now = todayItems(), done = doneTodayItems();
+  const soonCount = [...S.plants.filter(p => { const n = plantDue(p); return n > 0 && n <= 7; }),
+    ...S.tasks.filter(t => { const n = taskDue(t); return n > 0 && n <= 7; }),
+    ...S.todos.filter(t => !t.done && t.due && todoDue(t) > 0 && todoDue(t) <= 7)].length;
   $("#v-home").innerHTML = `
-    ${isWinter() ? `<div class="season">${icon("snow", 18)}<span>Rythme d'hiver : les arrosages sont espacés automatiquement jusqu'à fin février.</span></div>` : ""}
-    <div class="stats">
-      <button class="stat" data-act="tab" data-tab="plants"><b>${S.plants.length}</b><span>plantes</span></button>
-      <button class="stat" data-act="tab" data-tab="tasks"><b>${S.tasks.length}</b><span>tâches suivies</span></button>
-      <button class="stat" data-act="tab" data-tab="shop"><b>${inList.length}</b><span>dans la liste</span></button>
+    <span class="label">Ajouter</span>
+    <div class="shortcuts">
+      <button class="sc" data-act="new-todo">${icon("list", 22)}<span>To-do</span></button>
+      <button class="sc" data-act="quick-shop">${icon("basket", 22)}<span>Courses</span></button>
+      <button class="sc" data-act="new-task">${icon("tool", 22)}<span>Entretien</span></button>
+      <button class="sc" data-act="new-plant">${icon("leaf", 22)}<span>Plante</span></button>
     </div>
-    <div class="section-h"><h2>À faire maintenant</h2><span class="label num">${now.length}</span></div>
-    <div class="list">${now.length ? now.join("") : `<div class="empty">Rien d'urgent. Les plantes sont arrosées et l'entretien est à jour.</div>`}</div>
-    <div class="section-h"><h2>Dans les 7 prochains jours</h2><span class="label num">${soon.length}</span></div>
-    <div class="list">${soon.length ? soon.map(x => x.k === "p" ? plantRow(x.o) : taskRow(x.o)).join("") : `<div class="empty">Rien de prévu cette semaine.</div>`}</div>`;
+    <div class="section-h"><h2>À faire aujourd'hui</h2><span class="label num">${now.length}</span></div>
+    <div class="list">${now.length ? now.map(it => itemRow(it, false)).join("")
+      : `<div class="empty"><b style="color:var(--ink)">Rien à faire aujourd'hui.</b>${soonCount ? `${soonCount} chose${soonCount > 1 ? "s" : ""} prévue${soonCount > 1 ? "s" : ""} dans les 7 prochains jours.` : "Profites-en !"}</div>`}</div>
+    ${done.length ? `<div class="section-h"><h2 class="muted-h">Déjà fait aujourd'hui</h2><span class="label num">${done.length}</span></div>
+      <div class="list">${done.map(it => itemRow(it, true)).join("")}</div>` : ""}
+    ${isWinter() ? `<div class="season">${icon("snow", 18)}<span>Rythme d'hiver : les arrosages sont espacés automatiquement jusqu'à fin février.</span></div>` : ""}`;
 }
 
+let plantSort = (() => { try { return localStorage.getItem("maison:plantSort") || "room"; } catch (e) { return "room"; } })();
+function plantCard(p) {
+  const n = plantDue(p);
+  return `<div class="pcard" role="button" tabindex="0" data-act="open-plant" data-id="${esc(p.id)}">
+    <div class="ph">${p.photo ? `<img alt="" src="${esc(p.photo)}">` : icon("leaf", 40)}${dueChip(n, "Arroser")}</div>
+    <div class="bd"><div class="nm">${esc(p.name || "Plante")}</div><div class="sp">${esc(p.species || "Espèce inconnue")}</div>
+      <div class="ft"><small>${esc(every(plantInterval(p)))}</small>
+      <button class="water${p.lastWatered === todayStr() ? " on" : ""}" aria-label="${p.lastWatered === todayStr() ? `Annuler l'arrosage de ${esc(p.name)}` : `Marquer ${esc(p.name)} comme arrosée`}" data-act="tick" data-kind="plant" data-id="${esc(p.id)}">${icon(p.lastWatered === todayStr() ? "check" : "drop", 18)}</button></div></div>
+  </div>`;
+}
 function renderPlants() {
   const ps = [...S.plants].sort((a, b) => plantDue(a) - plantDue(b));
+  let body = "";
+  if (plantSort === "room") {
+    const groups = {}; ps.forEach(p => { (groups[p.room || "Autre"] ||= []).push(p); });
+    const order = [...ROOMS.filter(r => groups[r]), ...Object.keys(groups).filter(r => !ROOMS.includes(r))];
+    body = order.map(r => `<div class="section-h room-h"><h2>${esc(r)}</h2><span class="label num">${groups[r].length}</span></div>
+      <div class="grid">${groups[r].map(plantCard).join("")}</div>`).join("");
+  } else body = `<div class="grid">${ps.map(plantCard).join("")}</div>`;
   $("#v-plants").innerHTML = `
-    <div class="section-h"><p class="hint">${ps.length} plante${ps.length > 1 ? "s" : ""} · triées par prochain arrosage</p>
+    <div class="section-h">
+      <div class="seg" role="group" aria-label="Trier les plantes">
+        <button data-act="plant-sort" data-v="room" aria-pressed="${plantSort === "room"}">Par pièce</button>
+        <button data-act="plant-sort" data-v="water" aria-pressed="${plantSort === "water"}">Par arrosage</button>
+      </div>
       <button class="btn" data-act="new-plant">${icon("cam", 16)}Ajouter</button></div>
-    ${ps.length ? `<div class="grid">${ps.map(p => {
-      const n = plantDue(p);
-      return `<div class="pcard" role="button" tabindex="0" data-act="open-plant" data-id="${esc(p.id)}">
-        <div class="ph">${p.photo ? `<img alt="" src="${esc(p.photo)}">` : icon("leaf", 40)}${dueChip(n, "Arroser")}</div>
-        <div class="bd"><div class="nm">${esc(p.name || "Plante")}</div><div class="sp">${esc(p.species || "Espèce inconnue")}</div>
-          <div class="ft"><small>${esc(every(plantInterval(p)))}</small>
-          <button class="water" aria-label="Marquer ${esc(p.name)} comme arrosée" data-act="water" data-id="${esc(p.id)}">${icon("drop", 18)}</button></div></div>
-      </div>`;
-    }).join("")}</div>`
-      : `<div class="list"><div class="empty"><b style="color:var(--ink)">Aucune plante pour l'instant.</b>Prends une photo : l'espèce est reconnue et la fiche d'arrosage se remplit toute seule.<button class="btn" data-act="new-plant">${icon("cam", 16)}Ajouter une plante</button></div></div>`}`;
+    ${ps.length ? body
+      : `<div class="list"><div class="empty"><b style="color:var(--ink)">Aucune plante pour l'instant.</b>Ajoute ta première plante, avec une photo si tu veux.<button class="btn" data-act="new-plant">${icon("cam", 16)}Ajouter une plante</button></div></div>`}`;
 }
 
+function taskLine(t) {
+  const n = taskDue(t), on = n > 0;
+  return `<div class="row trow">
+    ${tickBtn("task", t.id, on, on ? `Remettre « ${t.title} » à faire` : `« ${t.title} » fait`)}
+    <button class="main rowbtn" data-act="open-task" data-id="${esc(t.id)}"><span class="title">${esc(t.title)}</span>
+      <span class="meta">${on ? `<span>Prochaine fois le ${shortDate(addDays(todayStr(), n))}</span>` : lateChip(n, "À faire aujourd'hui")}<span>${esc(every(t.everyDays || 30))}</span>${t.room ? `<span>${esc(t.room)}</span>` : ""}</span></button></div>`;
+}
 function renderTasks() {
   const ts = [...S.tasks].sort((a, b) => taskDue(a) - taskDue(b));
+  const todo = ts.filter(t => taskDue(t) <= 0), ok = ts.filter(t => taskDue(t) > 0);
   $("#v-tasks").innerHTML = `
-    <div class="section-h"><p class="hint">Chaque tâche revient après sa dernière réalisation.</p>
+    <div class="section-h"><p class="hint">Coche quand c'est fait : la tâche revient toute seule à la bonne date.</p>
       <button class="btn" data-act="new-task">${icon("plus", 16)}Nouvelle</button></div>
-    ${ts.length ? `<div class="list">${ts.map(taskRow).join("")}</div>`
-      : `<div class="list"><div class="empty"><b style="color:var(--ink)">Aucune tâche suivie.</b>Pars d'un modèle (détartrage, frigo, filtres…) ou crée la tienne.<button class="btn" data-act="new-task">${icon("plus", 16)}Ajouter une tâche</button></div></div>`}`;
+    ${ts.length ? `
+      <div class="section-h"><h2>À faire</h2><span class="label num">${todo.length}</span></div>
+      <div class="list">${todo.length ? todo.map(taskLine).join("") : `<div class="empty">Tout l'entretien est à jour.</div>`}</div>
+      ${ok.length ? `<div class="section-h"><h2 class="muted-h">À jour</h2><span class="label num">${ok.length}</span></div>
+      <div class="list">${ok.map(taskLine).join("")}</div>` : ""}`
+      : `<div class="list"><div class="empty"><b style="color:var(--ink)">Aucune tâche d'entretien.</b>Pars d'un modèle (détartrage, frigo, filtres…) ou crée la tienne.<button class="btn" data-act="new-task">${icon("plus", 16)}Ajouter une tâche</button></div></div>`}`;
+}
+
+/* ---------- to-do ---------- */
+function nextSaturday() { const d = new Date(); const add = (6 - d.getDay() + 7) % 7; return addDays(todayStr(), add); }
+function dueFromChoice(c) {
+  if (c === "today") return todayStr();
+  if (c === "tomorrow") return addDays(todayStr(), 1);
+  if (c === "weekend") return nextSaturday();
+  if (c === "date") { const v = $("#td-date") && $("#td-date").value; return v || null; }
+  return null;
+}
+function todoLine(t) {
+  const on = !!t.done;
+  return itemRow({ kind: "todo", o: t, n: todoDue(t) }, on);
+}
+function renderTodos() {
+  const open = S.todos.filter(t => !t.done);
+  const late = open.filter(t => t.due && todoDue(t) < 0).sort((a, b) => a.due.localeCompare(b.due));
+  const today = open.filter(t => t.due && todoDue(t) === 0);
+  const later = open.filter(t => t.due && todoDue(t) > 0).sort((a, b) => a.due.localeCompare(b.due));
+  const nodate = open.filter(t => !t.due).sort((a, b) => (a.createdAt || "").localeCompare(b.createdAt || ""));
+  const done = S.todos.filter(t => t.done).sort((a, b) => (b.doneAt || "").localeCompare(a.doneAt || ""));
+  const focused = document.activeElement && document.activeElement.id === "td-name";
+  const draftTxt = $("#td-name") ? $("#td-name").value : "";
+  const dateVal = $("#td-date") ? $("#td-date").value : "";
+  const chip = (v, l) => `<button type="button" class="fav${S.todoDue === v ? " sel" : ""}" data-act="td-due" data-v="${v}" aria-pressed="${S.todoDue === v}">${l}</button>`;
+  const sec = (title, arr, cls = "") => arr.length ? `<div class="section-h"><h2 class="${cls}">${title}</h2><span class="label num">${arr.length}</span></div><div class="list">${arr.map(todoLine).join("")}</div>` : "";
+  $("#v-todo").innerHTML = `
+    <form class="quickadd" id="td-form" autocomplete="off">
+      <input type="text" id="td-name" placeholder="Réserver, acheter, appeler…" aria-label="Chose à faire" value="${esc(draftTxt)}" enterkeyhint="done">
+      <button class="btn" type="submit">${icon("plus", 16)}Ajouter</button>
+    </form>
+    <div class="chips">${chip("none", "Sans date")}${chip("today", "Aujourd'hui")}${chip("tomorrow", "Demain")}${chip("weekend", "Ce week-end")}${chip("date", "Date…")}
+      ${S.todoDue === "date" ? `<input type="date" id="td-date" class="chipdate" value="${esc(dateVal || addDays(todayStr(), 7))}" min="${todayStr()}" aria-label="Échéance">` : ""}</div>
+    ${open.length ? sec("En retard", late, "late-h") + sec("Aujourd'hui", today) + sec("À venir", later) + sec("Sans date", nodate)
+      : `<div class="list"><div class="empty"><b style="color:var(--ink)">Rien sur la liste.</b>Ajoute ici ce qui n'est pas de l'entretien : billets de train, réservations, démarches, cadeaux…</div></div>`}
+    ${done.length ? `<details class="done-box"${S.showDone ? " open" : ""}><summary><span>Fait</span><span class="label num">${done.length}</span></summary>
+      <div class="list">${done.slice(0, 30).map(todoLine).join("")}</div>
+      <button class="btn ghost wide" data-act="td-clear">Effacer les tâches faites</button></details>` : ""}`;
+  const det = $("#v-todo details"); if (det) det.addEventListener("toggle", () => { S.showDone = det.open; });
+  if (focused) $("#td-name").focus();
+}
+function addTodo(title) {
+  title = title.trim(); if (!title) return;
+  const due = dueFromChoice(S.todoDue);
+  guard(store.set("todos", uid("d"), { title: title.charAt(0).toUpperCase() + title.slice(1), due, notes: "", done: false, doneAt: null, createdAt: new Date().toISOString() }));
+  toast(due ? `Ajouté pour ${due === todayStr() ? "aujourd'hui" : due === addDays(todayStr(), 1) ? "demain" : "le " + shortDate(due)}` : "Ajouté");
+}
+function todoSheet(t) {
+  const isNew = !t; t = t || { due: null };
+  openSheet(`
+    <div class="sheet-head"><h2>${isNew ? "Nouvelle chose à faire" : "Modifier"}</h2><button class="icobtn" data-act="close" aria-label="Fermer">${icon("x")}</button></div>
+    <form id="todo-form" class="view" style="padding:0" data-id="${esc(t.id || "")}">
+      <label class="field"><span>Quoi ?</span><input type="text" id="tf-title" required value="${esc(t.title || "")}" placeholder="Acheter les billets de train pour Noël"></label>
+      <label class="field"><span>Pour quand ? (facultatif)</span><input type="date" id="tf-due" value="${esc(t.due || "")}"></label>
+      <div class="chips">
+        <button type="button" class="fav" data-act="tf-set" data-v="${todayStr()}">Aujourd'hui</button>
+        <button type="button" class="fav" data-act="tf-set" data-v="${addDays(todayStr(), 1)}">Demain</button>
+        <button type="button" class="fav" data-act="tf-set" data-v="${nextSaturday()}">Ce week-end</button>
+        <button type="button" class="fav" data-act="tf-set" data-v="${addDays(todayStr(), 7)}">Dans une semaine</button>
+        <button type="button" class="fav" data-act="tf-set" data-v="">Sans date</button>
+      </div>
+      <label class="field"><span>Notes</span><textarea id="tf-notes" placeholder="Référence, lien, numéro…">${esc(t.notes || "")}</textarea></label>
+      <button class="btn wide" type="submit">Enregistrer</button>
+      ${!isNew ? `<button class="btn ghost wide" type="button" data-act="tick" data-kind="todo" data-id="${esc(t.id)}" data-close="1">${t.done ? "Remettre à faire" : `${icon("check", 16)}Marquer comme fait`}</button>
+        <button class="btn danger wide" type="button" data-act="del" data-col="todos" data-id="${esc(t.id)}">Supprimer</button>` : ""}
+    </form>`);
+  if (isNew) setTimeout(() => { const i = $("#tf-title"); if (i) i.focus(); }, 50);
+}
+function saveTodo(form) {
+  const id = form.dataset.id || uid("d"); const prev = store.cache.todos[id] || {};
+  const title = $("#tf-title").value.trim(); if (!title) return;
+  guard(store.set("todos", id, { ...prev, title, due: $("#tf-due").value || null, notes: $("#tf-notes").value.trim(),
+    done: !!prev.done, doneAt: prev.doneAt || null, createdAt: prev.createdAt || new Date().toISOString() }));
+  closeSheet(); toast(prev.title ? "Modifié" : "Ajouté");
 }
 
 function renderShop() {
@@ -535,10 +702,10 @@ function toast(msg, undo) {
 }
 
 /* ---------- tabs & actions ---------- */
-const TITLES = { home: "Aujourd'hui", plants: "Plantes", tasks: "Entretien", shop: "Courses" };
+const TITLES = { home: "Aujourd'hui", plants: "Plantes", tasks: "Entretien", todo: "To-do", shop: "Courses" };
 function setTab(t) {
   S.tab = t; document.querySelectorAll("nav.tabs button").forEach(b => b.setAttribute("aria-selected", String(b.dataset.tab === t)));
-  ["home", "plants", "tasks", "shop"].forEach(v => { $("#v-" + v).hidden = v !== t; });
+  Object.keys(TITLES).forEach(v => { $("#v-" + v).hidden = v !== t; });
   $("#view-title").textContent = TITLES[t]; window.scrollTo(0, 0);
   try { localStorage.setItem("maison:tab", t); } catch (e) { }
 }
@@ -560,10 +727,18 @@ document.addEventListener("click", e => {
     case "close": closeSheet(); break;
     case "new-plant": plantSheet(null); break;
     case "open-plant": { const p = S.plants.find(x => x.id === id); if (p) plantSheet(p); break; }
-    case "water": {
-      const p = S.plants.find(x => x.id === id); if (!p) break; const before = p.lastWatered;
-      guard(store.update("plants", id, { lastWatered: todayStr() })); if (el.dataset.close) closeSheet();
-      toast(`${p.name} arrosée · prochaine fois le ${shortDate(addDays(todayStr(), plantInterval(p)))}`, () => guard(store.update("plants", id, { lastWatered: before })));
+    case "water": tick("plant", id); if (el.dataset.close) closeSheet(); break;
+    case "tick": tick(el.dataset.kind, id); if (el.dataset.close) closeSheet(); break;
+    case "plant-sort": plantSort = el.dataset.v; try { localStorage.setItem("maison:plantSort", plantSort); } catch (err) { } renderPlants(); break;
+    case "new-todo": todoSheet(null); break;
+    case "open-todo": { const t = S.todos.find(x => x.id === id); if (t) todoSheet(t); break; }
+    case "quick-shop": setTab("shop"); setTimeout(() => { const i = $("#g-name"); if (i) i.focus(); }, 60); break;
+    case "td-due": S.todoDue = el.dataset.v; renderTodos(); if (S.todoDue === "date") { const d = $("#td-date"); if (d) { try { d.showPicker(); } catch (err) { d.focus(); } } } break;
+    case "tf-set": $("#tf-due").value = el.dataset.v; break;
+    case "td-clear": {
+      if (armed !== el) { armed = el; el.classList.add("danger", "armed"); el.textContent = "Confirmer : effacer les tâches faites"; break; }
+      armed = null;
+      (async () => { for (const t of S.todos.filter(x => x.done)) { try { await store.remove("todos", t.id); } catch (err) { guard(Promise.reject(err)); return; } } toast("Tâches faites effacées"); })();
       break;
     }
     case "new-task": taskSheet(null); break;
@@ -571,13 +746,6 @@ document.addEventListener("click", e => {
     case "tpl": {
       const tp = TEMPLATES[+el.dataset.i]; $("#t-title").value = tp.title; $("#t-room").value = tp.room;
       const [n, u] = unitOf(tp.everyDays); $("#t-n").value = n; $("#t-u").value = u; break;
-    }
-    case "done": {
-      const t = S.tasks.find(x => x.id === id); if (!t) break; const before = { lastDone: t.lastDone, history: t.history || [] };
-      const history = [...(t.history || []), todayStr()].slice(-12);
-      guard(store.update("tasks", id, { lastDone: todayStr(), history }));
-      toast(`Fait · prochaine fois le ${shortDate(addDays(todayStr(), t.everyDays || 30))}`, () => guard(store.update("tasks", id, before)));
-      break;
     }
     case "del": {
       if (armed !== el) { armed = el; el.classList.add("armed"); el.textContent = "Confirmer la suppression"; break; }
@@ -649,7 +817,10 @@ document.addEventListener("submit", e => {
   e.preventDefault();
   if (e.target.id === "plant-form") savePlant(e.target);
   else if (e.target.id === "task-form") saveTask(e.target);
-  else if (e.target.id === "g-form") { const i = $("#g-name"); addGrocery(i.value); i.value = ""; i.focus(); }
+  // on vide le champ AVANT l'ajout : l'ajout redessine la liste et recopie le contenu du champ
+  else if (e.target.id === "g-form") { const v = $("#g-name").value; $("#g-name").value = ""; addGrocery(v); const i = $("#g-name"); if (i) { i.value = ""; i.focus(); } }
+  else if (e.target.id === "td-form") { const v = $("#td-name").value; $("#td-name").value = ""; addTodo(v); const i = $("#td-name"); if (i) { i.value = ""; i.focus(); } }
+  else if (e.target.id === "todo-form") saveTodo(e.target);
   else if (e.target.id === "login-form") signIn(e.target);
   else if (e.target.id === "signup-form") signUp(e.target);
   else if (e.target.id === "hh-create-form") createHousehold(e.target);
@@ -769,7 +940,7 @@ async function leaveHousehold() {
   const h = S.household; if (!h) return;
   const { error } = await sb.rpc("leave_household", { h: h.id });
   if (error) { toast("Impossible de quitter le foyer pour l'instant."); return; }
-  ["plants", "tasks", "groceries"].forEach(t => { try { localStorage.removeItem(`maison:${h.id}:${t}`); } catch (e) { } });
+  TABLES.forEach(t => { try { localStorage.removeItem(`maison:${h.id}:${t}`); } catch (e) { } });
   closeSheet();
   await loadHouseholds().catch(() => { S.households = S.households.filter(x => x.id !== h.id); });
   store.unsubscribe(); store.hid = null; S.household = null;
@@ -791,6 +962,21 @@ async function startApp(user) {
 }
 
 $("#today-label").textContent = new Date().toLocaleDateString("fr-FR", { weekday: "long", day: "numeric", month: "long" });
+
+/* Pas d'auto-remplissage (adresse, contacts…) dans les champs de l'app, sauf la connexion.
+   iOS ignore parfois autocomplete="off" : on donne aussi un nom neutre au champ. */
+function noAutofill(root) {
+  root.querySelectorAll('input:not([type=checkbox]):not([type=file]):not([type=date]):not([type=hidden]):not([data-af]), textarea:not([data-af])').forEach(el => {
+    el.setAttribute("data-af", "1");
+    if (el.id === "l-email" || el.id === "l-pass") return;
+    el.setAttribute("autocomplete", "off");
+    el.setAttribute("name", "f-" + (el.id || "x") + "-" + Math.random().toString(36).slice(2, 6));
+    el.setAttribute("data-1p-ignore", ""); el.setAttribute("data-lpignore", "true"); el.setAttribute("data-form-type", "other");
+    if (el.type !== "number" && !el.classList.contains("code-input")) { el.setAttribute("autocapitalize", "sentences"); el.setAttribute("autocorrect", "on"); }
+  });
+}
+new MutationObserver(() => noAutofill(document.body)).observe(document.body, { childList: true, subtree: true });
+noAutofill(document.body);
 
 if ("serviceWorker" in navigator) {
   navigator.serviceWorker.register("./sw.js").catch(err => console.warn("SW", err));
