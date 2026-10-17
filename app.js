@@ -420,8 +420,8 @@ function renderShop() {
       : `<div class="empty">La liste est vide. Ajoute un article dès qu'il manque quelque chose : elle sera prête le jour de la commande.</div>`}</div>
     ${list.length ? `<div class="actions">
       <button class="btn ghost" data-act="g-copy">Copier la liste</button>
-      <button class="btn" data-act="g-ordered">Commande passée</button></div>
-      <p class="hint">« Commande passée » vide la liste. Les articles étoilés restent dans tes habituels.</p>` : ""}`;
+      <button class="btn" data-act="g-ordered">Commande passée${checked ? ` (${checked})` : ""}</button></div>
+      <p class="hint">Coche les articles au fur et à mesure que tu les mets dans le panier du drive. « Commande passée » retire les articles cochés et garde les autres. Les articles étoilés restent dans tes habituels.</p>` : ""}`;
   if (focused) $("#g-name").focus();
 }
 
@@ -767,15 +767,25 @@ document.addEventListener("click", e => {
       break;
     }
     case "g-ordered": {
-      if (armed !== el) { armed = el; el.classList.add("danger", "armed"); el.textContent = "Confirmer : vider la liste"; break; }
+      // Ne retire que les articles cochés (mis au panier) ; les autres restent pour la prochaine commande.
+      // Si rien n'est coché, on propose de tout vider (après confirmation).
+      const inList = S.groceries.filter(x => x.inList);
+      const picked = inList.filter(x => x.checked);
+      const targets = picked.length ? picked : inList;
+      if (armed !== el) {
+        armed = el; el.classList.add("danger", "armed");
+        el.textContent = picked.length ? `Confirmer : retirer ${picked.length} article${picked.length > 1 ? "s" : ""} coché${picked.length > 1 ? "s" : ""}` : "Aucun article coché : tout vider ?";
+        break;
+      }
       armed = null;
       const now = new Date().toISOString();
+      const left = inList.length - targets.length;
       (async () => {
-        for (const g of S.groceries.filter(x => x.inList)) {
+        for (const g of targets) {
           try { if (g.fav) await store.update("groceries", g.id, { inList: false, checked: false, lastBought: now }); else await store.remove("groceries", g.id); }
           catch (err) { guard(Promise.reject(err)); return; }
         }
-        toast("Liste vidée, bonne commande !");
+        toast(left ? `Commande notée · ${left} article${left > 1 ? "s" : ""} non coché${left > 1 ? "s" : ""} gardé${left > 1 ? "s" : ""} pour la prochaine fois` : "Liste vidée, bonne commande !");
       })();
       break;
     }
