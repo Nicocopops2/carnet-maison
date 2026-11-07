@@ -234,7 +234,7 @@ header.top{padding-top:calc(18px + env(safe-area-inset-top,0px));top:0}
 .fhead{display:flex;align-items:center;gap:10px}
 .fhead .fh-name{flex:1;min-width:0;font-size:21px;overflow-wrap:anywhere}
 .ftag{display:inline-flex;align-items:center;gap:3px;color:var(--fc);font-weight:600}
-#v-todo .ftag{display:none}
+#v-todo.no-ftag .ftag{display:none}
 .swatches{display:flex;gap:10px;flex-wrap:wrap}
 .swatch{width:34px;height:34px;border-radius:50%;border:3px solid var(--surface);background:var(--fc);box-shadow:0 0 0 1px var(--line)}
 .swatch.sel{box-shadow:0 0 0 2px var(--ink)}
@@ -293,3 +293,10 @@ header.top{margin-inline:-16px;padding-inline:16px}
 .qstep{display:flex;gap:8px;align-items:center}
 .qstep input{flex:1;min-width:0;text-align:center;font-size:18px!important}
 .qstep .btn{width:44px;height:44px;padding:0;font-size:22px}
+
+/* v10 : vue « Par dossier » des to-do */
+.fsec{display:flex;align-items:center;gap:10px;width:100%;border:0;background:transparent;padding:4px 0;text-align:left;color:var(--ink);cursor:pointer}
+.fsec .fico{width:30px;height:30px;border-radius:9px}
+.fsec-name{flex:1;min-width:0;font-family:var(--display);font-weight:700;font-size:17px;overflow-wrap:break-word}
+.fsec .chev{font-size:22px;color:var(--muted);line-height:1}
+.fsec:hover .fsec-name{color:var(--accent)}

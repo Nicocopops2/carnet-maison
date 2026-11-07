@@ -408,9 +408,13 @@ function todoLine(t) {
   const on = !!t.done;
   return itemRow({ kind: "todo", o: t, n: todoDue(t) }, on);
 }
+let todoSort = (() => { try { return localStorage.getItem("maison:todoSort") || "date"; } catch (e) { return "date"; } })();
+function byDue(a, b) { return (a.due || "9999").localeCompare(b.due || "9999") || (a.createdAt || "").localeCompare(b.createdAt || ""); }
 function renderTodos() {
   let f = folderById(S.todoFolder); if (!f) S.todoFolder = null;
-  const scope = S.todos.filter(t => inFolder(t, f && f.id));
+  const mode = f ? "folder-open" : todoSort;
+  // Dans un dossier : ses tâches. Vue principale : toutes les tâches (dossiers compris).
+  const scope = f ? S.todos.filter(t => t.folderId === f.id) : S.todos;
   const open = scope.filter(t => !t.done);
   const late = open.filter(t => t.due && todoDue(t) < 0).sort((a, b) => a.due.localeCompare(b.due));
   const today = open.filter(t => t.due && todoDue(t) === 0);
@@ -422,6 +426,26 @@ function renderTodos() {
   const dateVal = $("#td-date") ? $("#td-date").value : "";
   const chip = (v, l) => `<button type="button" class="fav${S.todoDue === v ? " sel" : ""}" data-act="td-due" data-v="${v}" aria-pressed="${S.todoDue === v}">${l}</button>`;
   const sec = (title, arr, cls = "") => arr.length ? `<div class="section-h"><h2 class="${cls}">${title}</h2><span class="label num">${arr.length}</span></div><div class="list">${arr.map(todoLine).join("")}</div>` : "";
+  // Vue « Par dossier » : une section par dossier (titre cliquable), puis « Sans dossier »
+  const byFolder = () => {
+    const fs = folderList("todo");
+    const parts = fs.map(x => {
+      const items = open.filter(t => t.folderId === x.id).sort(byDue);
+      return `<button class="fsec" data-act="open-folder" data-kind="todo" data-id="${esc(x.id)}">
+          <span class="fico c${(x.color || 0) % FOLDER_COLORS}">${icon("folder", 16)}</span><span class="fsec-name">${esc(x.name)}</span>
+          <span class="label num">${items.length}</span><span class="chev">›</span></button>
+        <div class="list">${items.length ? items.map(todoLine).join("") : `<div class="empty">Tout est fait dans ce dossier.</div>`}</div>`;
+    }).join("");
+    const loose = open.filter(t => !folderById(t.folderId)).sort(byDue);
+    return parts + (loose.length ? `<div class="section-h"><h2 class="small-h">Sans dossier</h2><span class="label num">${loose.length}</span></div><div class="list">${loose.map(todoLine).join("")}</div>` : "")
+      + (!fs.length && !loose.length ? `<div class="list"><div class="empty"><b style="color:var(--ink)">Rien sur la liste.</b>Crée un dossier pour regrouper les tâches d'un projet.</div></div>` : "");
+  };
+  const sortBar = f ? "" : `<div class="section-h">
+      <div class="seg" role="group" aria-label="Afficher les tâches">
+        <button data-act="todo-sort" data-v="date" aria-pressed="${todoSort === "date"}">Par date</button>
+        <button data-act="todo-sort" data-v="folder" aria-pressed="${todoSort === "folder"}">Par dossier</button>
+      </div>
+      <button class="btn quiet sm" data-act="new-folder" data-kind="todo">${icon("plus", 14)}Dossier</button></div>`;
   $("#v-todo").innerHTML = `
     ${f ? folderHead("todo", f) : ""}
     <form class="quickadd" id="td-form" autocomplete="off">
@@ -430,14 +454,17 @@ function renderTodos() {
     </form>
     <div class="chips">${chip("none", "Sans date")}${chip("today", "Aujourd'hui")}${chip("tomorrow", "Demain")}${chip("weekend", "Ce week-end")}${chip("date", "Date…")}
       ${S.todoDue === "date" ? `<input type="date" id="td-date" class="chipdate" value="${esc(dateVal || addDays(todayStr(), 7))}" min="${todayStr()}" aria-label="Échéance">` : ""}</div>
-    ${f ? "" : folderCards("todo")}
+    ${sortBar}
     ${f && !scope.length ? `<div class="list"><div class="empty"><b style="color:var(--ink)">Dossier vide.</b>Ajoute les tâches de ce projet avec le champ ci-dessus.</div></div>` : ""}
-    ${open.length ? sec("En retard", late, "late-h") + sec("Aujourd'hui", today) + sec("À venir", later) + sec(f ? "Sans date" : (late.length + today.length + later.length ? "Sans date" : "À faire"), nodate)
+    ${mode === "folder" ? byFolder()
+      : open.length ? sec("En retard", late, "late-h") + sec("Aujourd'hui", today) + sec("À venir", later) + sec(late.length + today.length + later.length ? "Sans date" : "À faire", nodate)
       : (!f ? `<div class="list"><div class="empty"><b style="color:var(--ink)">Rien sur la liste.</b>Ajoute ici ce qui n'est pas de l'entretien : billets de train, réservations, démarches, cadeaux…</div></div>`
           : scope.length ? `<div class="list"><div class="empty">Tout est fait dans ce dossier. Tu peux le supprimer avec le bouton ⋯.</div></div>` : "")}
     ${done.length ? `<details class="done-box"${S.showDone ? " open" : ""}><summary><span>Fait</span><span class="label num">${done.length}</span></summary>
       <div class="list">${done.slice(0, 30).map(todoLine).join("")}</div>
       <button class="btn ghost wide" data-act="td-clear">Effacer les tâches faites${f ? " du dossier" : ""}</button></details>` : ""}`;
+  // L'étiquette de dossier n'est utile que dans la vue « Par date »
+  $("#v-todo").classList.toggle("no-ftag", mode !== "date");
   const det = $("#v-todo details"); if (det) det.addEventListener("toggle", () => { S.showDone = det.open; });
   if (focused) $("#td-name").focus();
 }
@@ -947,7 +974,7 @@ document.addEventListener("click", e => {
     case "td-clear": {
       if (armed !== el) { armed = el; el.classList.add("danger", "armed"); el.textContent = "Confirmer : effacer les tâches faites"; break; }
       armed = null;
-      (async () => { for (const t of S.todos.filter(x => x.done && inFolder(x, folderById(S.todoFolder) ? S.todoFolder : null))) { try { await store.remove("todos", t.id); } catch (err) { guard(Promise.reject(err)); return; } } toast("Tâches faites effacées"); })();
+      (async () => { for (const t of S.todos.filter(x => x.done && (folderById(S.todoFolder) ? x.folderId === S.todoFolder : true))) { try { await store.remove("todos", t.id); } catch (err) { guard(Promise.reject(err)); return; } } toast("Tâches faites effacées"); })();
       break;
     }
     case "new-task": taskSheet(null); break;
@@ -974,6 +1001,7 @@ document.addEventListener("click", e => {
       i.value = rest.trim() ? `${n}${rest}` : `×${n}`; break;
     }
     case "q-clear": guard(store.update("groceries", $("#qty-form").dataset.id, { qty: "" })); closeSheet(); break;
+    case "todo-sort": todoSort = el.dataset.v; try { localStorage.setItem("maison:todoSort", todoSort); } catch (err) { } renderTodos(); break;
     case "open-folder": if (el.dataset.kind === "todo") { S.todoFolder = id; renderTodos(); } else { S.shopFolder = id; renderShop(); } window.scrollTo(0, 0); break;
     case "close-folder": if (el.dataset.kind === "todo") { S.todoFolder = null; renderTodos(); } else { S.shopFolder = null; renderShop(); } window.scrollTo(0, 0); break;
     case "new-folder": folderSheet(el.dataset.kind, null); break;
