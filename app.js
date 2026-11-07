@@ -45,10 +45,10 @@ function dueChip(n, verb) {
 }
 
 /* ---------- storage (Supabase + cache local, par foyer) ---------- */
-const TABLES = ["plants", "tasks", "todos", "groceries"];
+const TABLES = ["plants", "tasks", "todos", "groceries", "folders"];
 const store = {
   hid: null,
-  cache: { plants: {}, tasks: {}, groceries: {} },
+  cache: { plants: {}, tasks: {}, todos: {}, groceries: {}, folders: {} },
   channel: null,
   key(t) { return `maison:${this.hid}:${t}`; },
   loadLocal() {
@@ -60,13 +60,16 @@ const store = {
   emit(t) { this.saveLocal(t); S[t] = this.rows(t); render(); },
   async fetchAll() {
     const hid = this.hid;
+    let firstError = null;
     for (const t of TABLES) {
       const { data, error } = await sb.from(t).select("id,data").eq("household_id", hid);
-      if (error) throw error;
+      // Une table absente (script SQL pas encore relancé) ne doit pas empêcher de charger les autres
+      if (error) { console.warn("chargement", t, error); if (t !== "folders") firstError = firstError || error; continue; }
       if (hid !== this.hid) return;           // foyer changé entre-temps
       this.cache[t] = Object.fromEntries((data || []).map(r => [r.id, r.data]));
       this.emit(t);
     }
+    if (firstError) throw firstError;
   },
   unsubscribe() { if (this.channel) { sb.removeChannel(this.channel); this.channel = null; } },
   subscribe() {
@@ -111,7 +114,7 @@ function setSync(state) {
 }
 
 /* ---------- state ---------- */
-const S = { tab: "home", plants: [], tasks: [], groceries: [], todos: [], user: null, household: null, households: [], todoDue: "none" };
+const S = { tab: "home", plants: [], tasks: [], groceries: [], todos: [], folders: [], user: null, household: null, households: [], todoDue: "none", todoFolder: null, shopFolder: null };
 let armed = null;
 
 function plantInterval(p) { return isWinter() ? (p.waterWinterDays || Math.round((p.waterEveryDays || 7) * 1.5)) : (p.waterEveryDays || 7); }
@@ -188,7 +191,7 @@ const AISLES = [
   ["Épicerie", /\b(pates|riz|farine|sucre|huile|cafe|the|cereales|conserves?|sauce|sel|poivre|chocolat|biscuits?|confiture|miel|lentilles|pois chiches|semoule|vinaigre|moutarde|epices?)\b/]
 ];
 const AISLE_NAMES = [...AISLES.map(a => a[0]), "Autre"];
-const norm = s => s.toLowerCase().replace(/œ/g, "oe").normalize("NFD").replace(/[̀-ͯ]/g, "").trim();
+const norm = s => s.toLowerCase().replace(/œ/g, "oe").normalize("NFD").replace(/[\u0300-\u036f]/g, "").trim();
 function guessAisle(name) { const n = norm(name); for (const [a, re] of AISLES) if (re.test(n)) return a; return "Autre"; }
 
 /* ---------- templates ---------- */
@@ -208,6 +211,79 @@ const TEMPLATES = [
 ];
 const ROOMS = ["Cuisine", "Salle de bain", "Buanderie", "Salon", "Chambre", "Bureau", "Extérieur", "Toute la maison"];
 const LIGHTS = ["Plein soleil", "Lumière vive indirecte", "Mi-ombre", "Ombre"];
+
+/* ---------- dossiers (to-do et courses) ---------- */
+const FOLDER_COLORS = 6;
+const folderList = kind => S.folders.filter(f => f.kind === kind).sort((a, b) => (a.createdAt || "").localeCompare(b.createdAt || ""));
+const folderById = id => id ? S.folders.find(f => f.id === id) || null : null;
+// Un élément dont le dossier a été supprimé ailleurs repasse simplement « sans dossier »
+const inFolder = (item, fid) => fid ? item.folderId === fid : !folderById(item.folderId);
+const folderTag = f => f ? `<span class="ftag c${(f.color || 0) % FOLDER_COLORS}">${icon("folder", 12)}${esc(f.name)}</span>` : "";
+function folderCards(kind) {
+  const fs = folderList(kind);
+  const cards = fs.map(f => {
+    let sub;
+    if (kind === "todo") {
+      const open = S.todos.filter(t => t.folderId === f.id && !t.done);
+      const late = open.filter(t => t.due && todoDue(t) <= 0).length;
+      sub = open.length ? `${open.length} à faire${late ? ` · <b class="late-t">${late} aujourd'hui</b>` : ""}` : "Tout est fait";
+    } else {
+      const items = S.groceries.filter(g => g.inList && g.folderId === f.id);
+      const ck = items.filter(g => g.checked).length;
+      sub = items.length ? `${items.length} article${items.length > 1 ? "s" : ""}${ck ? ` · ${ck} au panier` : ""}` : "Liste vide";
+    }
+    return `<button class="fcard" data-act="open-folder" data-kind="${kind}" data-id="${esc(f.id)}">
+      <span class="fico c${(f.color || 0) % FOLDER_COLORS}">${icon("folder", 20)}</span>
+      <span class="fbody"><span class="fname">${esc(f.name)}</span><span class="fsub">${sub}</span></span></button>`;
+  }).join("");
+  return `<div class="section-h"><h2 class="small-h">Dossiers</h2><button class="btn quiet sm" data-act="new-folder" data-kind="${kind}">${icon("plus", 14)}Dossier</button></div>
+    ${fs.length ? `<div class="folders">${cards}</div>` : `<p class="hint">${kind === "todo" ? "Regroupe les tâches d'un même projet, par exemple « Voyage à Alicante »." : "Regroupe des courses par recette, par magasin ou par projet, par exemple « Lasagnes » ou « Bricolage balcon »."}</p>`}`;
+}
+function folderHead(kind, f) {
+  return `<div class="fhead">
+    <button class="btn ghost sm" data-act="close-folder" data-kind="${kind}">← ${kind === "todo" ? "To-do" : "Courses"}</button>
+    <span class="fico c${(f.color || 0) % FOLDER_COLORS}">${icon("folder", 18)}</span>
+    <h2 class="fh-name">${esc(f.name)}</h2>
+    <button class="icobtn" data-act="edit-folder" data-id="${esc(f.id)}" aria-label="Modifier le dossier">${icon("dots", 20)}</button>
+  </div>`;
+}
+function folderSheet(kind, f) {
+  const isNew = !f; f = f || { kind, color: folderList(kind).length % FOLDER_COLORS };
+  const count = isNew ? 0 : kind === "todo" ? S.todos.filter(t => t.folderId === f.id).length : S.groceries.filter(g => g.inList && g.folderId === f.id).length;
+  openSheet(`
+    <div class="sheet-head"><h2>${isNew ? "Nouveau dossier" : "Modifier le dossier"}</h2><button class="icobtn" data-act="close" aria-label="Fermer">${icon("x")}</button></div>
+    <form id="folder-form" class="view" style="padding:0" data-id="${esc(f.id || "")}" data-kind="${kind}">
+      <label class="field"><span>Nom</span><input type="text" id="fo-name" required maxlength="40" value="${esc(f.name || "")}" placeholder="${kind === "todo" ? "Voyage à Alicante" : "Lasagnes, Leroy Merlin, Anniversaire…"}"></label>
+      <div class="field"><span>Couleur</span><div class="swatches">${Array.from({ length: FOLDER_COLORS }, (_, i) =>
+        `<button type="button" class="swatch c${i}${(f.color || 0) % FOLDER_COLORS === i ? " sel" : ""}" data-act="fo-color" data-v="${i}" aria-label="Couleur ${i + 1}" aria-pressed="${(f.color || 0) % FOLDER_COLORS === i}"></button>`).join("")}</div>
+        <input type="hidden" id="fo-color" value="${(f.color || 0) % FOLDER_COLORS}"></div>
+      <button class="btn wide" type="submit">${isNew ? "Créer le dossier" : "Enregistrer"}</button>
+      ${!isNew ? `<button class="btn danger wide" type="button" data-act="del-folder" data-id="${esc(f.id)}">Supprimer le dossier</button>
+        <p class="hint">${count ? `Les ${count} élément${count > 1 ? "s" : ""} du dossier ne sont pas supprimés : ${count > 1 ? "ils repassent" : "il repasse"} dans la liste principale.` : "Le dossier est vide."}</p>` : ""}
+    </form>`);
+  if (isNew) setTimeout(() => { const i = $("#fo-name"); if (i) i.focus(); }, 50);
+}
+function saveFolder(form) {
+  const kind = form.dataset.kind, id = form.dataset.id || uid("f"); const prev = store.cache.folders[id] || {};
+  const name = $("#fo-name").value.trim(); if (!name) return;
+  guard(store.set("folders", id, { ...prev, kind, name, color: +$("#fo-color").value || 0, createdAt: prev.createdAt || new Date().toISOString() }));
+  closeSheet();
+  if (!prev.name) { if (kind === "todo") S.todoFolder = id; else S.shopFolder = id; render(); toast(`Dossier « ${name} » créé`); }
+  else toast("Dossier modifié");
+}
+async function deleteFolder(id) {
+  const f = folderById(id); if (!f) return;
+  const col = f.kind === "todo" ? "todos" : "groceries";
+  const items = (f.kind === "todo" ? S.todos : S.groceries).filter(x => x.folderId === id);
+  closeSheet();
+  try {
+    for (const x of items) await store.update(col, x.id, { folderId: null });
+    await store.remove("folders", id);
+  } catch (err) { guard(Promise.reject(err)); return; }
+  if (S.todoFolder === id) S.todoFolder = null;
+  if (S.shopFolder === id) S.shopFolder = null;
+  render(); toast(`Dossier « ${f.name} » supprimé`);
+}
 
 /* ---------- render ---------- */
 function render() {
@@ -244,7 +320,7 @@ function itemRow(it, on) {
   return `<div class="row trow${on ? " isdone" : ""}">
       ${tickBtn("todo", o.id, on, on ? `Remettre « ${o.title} » à faire` : `« ${o.title} » fait`)}
       <button class="main rowbtn" data-act="open-todo" data-id="${esc(o.id)}"><span class="title">${esc(o.title)}</span>
-        <span class="meta"><span class="kind">${icon("list", 13)}To-do</span>${on ? "" : lateChip(it.n)}${o.notes ? `<span class="trunc">${esc(o.notes)}</span>` : ""}</span></button></div>`;
+        <span class="meta"><span class="kind">${icon("list", 13)}To-do</span>${folderTag(folderById(o.folderId))}${on ? "" : lateChip(it.n)}${o.notes ? `<span class="trunc">${esc(o.notes)}</span>` : ""}</span></button></div>`;
 }
 
 function renderHome() {
@@ -333,40 +409,47 @@ function todoLine(t) {
   return itemRow({ kind: "todo", o: t, n: todoDue(t) }, on);
 }
 function renderTodos() {
-  const open = S.todos.filter(t => !t.done);
+  let f = folderById(S.todoFolder); if (!f) S.todoFolder = null;
+  const scope = S.todos.filter(t => inFolder(t, f && f.id));
+  const open = scope.filter(t => !t.done);
   const late = open.filter(t => t.due && todoDue(t) < 0).sort((a, b) => a.due.localeCompare(b.due));
   const today = open.filter(t => t.due && todoDue(t) === 0);
   const later = open.filter(t => t.due && todoDue(t) > 0).sort((a, b) => a.due.localeCompare(b.due));
   const nodate = open.filter(t => !t.due).sort((a, b) => (a.createdAt || "").localeCompare(b.createdAt || ""));
-  const done = S.todos.filter(t => t.done).sort((a, b) => (b.doneAt || "").localeCompare(a.doneAt || ""));
+  const done = scope.filter(t => t.done).sort((a, b) => (b.doneAt || "").localeCompare(a.doneAt || ""));
   const focused = document.activeElement && document.activeElement.id === "td-name";
   const draftTxt = $("#td-name") ? $("#td-name").value : "";
   const dateVal = $("#td-date") ? $("#td-date").value : "";
   const chip = (v, l) => `<button type="button" class="fav${S.todoDue === v ? " sel" : ""}" data-act="td-due" data-v="${v}" aria-pressed="${S.todoDue === v}">${l}</button>`;
   const sec = (title, arr, cls = "") => arr.length ? `<div class="section-h"><h2 class="${cls}">${title}</h2><span class="label num">${arr.length}</span></div><div class="list">${arr.map(todoLine).join("")}</div>` : "";
   $("#v-todo").innerHTML = `
+    ${f ? folderHead("todo", f) : ""}
     <form class="quickadd" id="td-form" autocomplete="off">
-      <input type="text" id="td-name" placeholder="Réserver, acheter, appeler…" aria-label="Chose à faire" value="${esc(draftTxt)}" enterkeyhint="done">
+      <input type="text" id="td-name" placeholder="${f ? `Ajouter à « ${esc(f.name)} »…` : "Réserver, acheter, appeler…"}" aria-label="Chose à faire" value="${esc(draftTxt)}" enterkeyhint="done">
       <button class="btn" type="submit">${icon("plus", 16)}Ajouter</button>
     </form>
     <div class="chips">${chip("none", "Sans date")}${chip("today", "Aujourd'hui")}${chip("tomorrow", "Demain")}${chip("weekend", "Ce week-end")}${chip("date", "Date…")}
       ${S.todoDue === "date" ? `<input type="date" id="td-date" class="chipdate" value="${esc(dateVal || addDays(todayStr(), 7))}" min="${todayStr()}" aria-label="Échéance">` : ""}</div>
-    ${open.length ? sec("En retard", late, "late-h") + sec("Aujourd'hui", today) + sec("À venir", later) + sec("Sans date", nodate)
-      : `<div class="list"><div class="empty"><b style="color:var(--ink)">Rien sur la liste.</b>Ajoute ici ce qui n'est pas de l'entretien : billets de train, réservations, démarches, cadeaux…</div></div>`}
+    ${f ? "" : folderCards("todo")}
+    ${f && !scope.length ? `<div class="list"><div class="empty"><b style="color:var(--ink)">Dossier vide.</b>Ajoute les tâches de ce projet avec le champ ci-dessus.</div></div>` : ""}
+    ${open.length ? sec("En retard", late, "late-h") + sec("Aujourd'hui", today) + sec("À venir", later) + sec(f ? "Sans date" : (late.length + today.length + later.length ? "Sans date" : "À faire"), nodate)
+      : (!f ? `<div class="list"><div class="empty"><b style="color:var(--ink)">Rien sur la liste.</b>Ajoute ici ce qui n'est pas de l'entretien : billets de train, réservations, démarches, cadeaux…</div></div>`
+          : scope.length ? `<div class="list"><div class="empty">Tout est fait dans ce dossier. Tu peux le supprimer avec le bouton ⋯.</div></div>` : "")}
     ${done.length ? `<details class="done-box"${S.showDone ? " open" : ""}><summary><span>Fait</span><span class="label num">${done.length}</span></summary>
       <div class="list">${done.slice(0, 30).map(todoLine).join("")}</div>
-      <button class="btn ghost wide" data-act="td-clear">Effacer les tâches faites</button></details>` : ""}`;
+      <button class="btn ghost wide" data-act="td-clear">Effacer les tâches faites${f ? " du dossier" : ""}</button></details>` : ""}`;
   const det = $("#v-todo details"); if (det) det.addEventListener("toggle", () => { S.showDone = det.open; });
   if (focused) $("#td-name").focus();
 }
 function addTodo(title) {
   title = title.trim(); if (!title) return;
   const due = dueFromChoice(S.todoDue);
-  guard(store.set("todos", uid("d"), { title: title.charAt(0).toUpperCase() + title.slice(1), due, notes: "", done: false, doneAt: null, createdAt: new Date().toISOString() }));
+  guard(store.set("todos", uid("d"), { title: title.charAt(0).toUpperCase() + title.slice(1), due, notes: "", done: false, doneAt: null, folderId: folderById(S.todoFolder) ? S.todoFolder : null, createdAt: new Date().toISOString() }));
   toast(due ? `Ajouté pour ${due === todayStr() ? "aujourd'hui" : due === addDays(todayStr(), 1) ? "demain" : "le " + shortDate(due)}` : "Ajouté");
 }
 function todoSheet(t) {
-  const isNew = !t; t = t || { due: null };
+  const isNew = !t; t = t || { due: null, folderId: folderById(S.todoFolder) ? S.todoFolder : null };
+  const fs = folderList("todo");
   openSheet(`
     <div class="sheet-head"><h2>${isNew ? "Nouvelle chose à faire" : "Modifier"}</h2><button class="icobtn" data-act="close" aria-label="Fermer">${icon("x")}</button></div>
     <form id="todo-form" class="view" style="padding:0" data-id="${esc(t.id || "")}">
@@ -379,6 +462,7 @@ function todoSheet(t) {
         <button type="button" class="fav" data-act="tf-set" data-v="${addDays(todayStr(), 7)}">Dans une semaine</button>
         <button type="button" class="fav" data-act="tf-set" data-v="">Sans date</button>
       </div>
+      ${fs.length ? `<label class="field"><span>Dossier</span><select id="tf-folder"><option value="">Aucun dossier</option>${fs.map(x => `<option value="${esc(x.id)}" ${x.id === t.folderId ? "selected" : ""}>${esc(x.name)}</option>`).join("")}</select></label>` : ""}
       <label class="field"><span>Notes</span><textarea id="tf-notes" placeholder="Référence, lien, numéro…">${esc(t.notes || "")}</textarea></label>
       <button class="btn wide" type="submit">Enregistrer</button>
       ${!isNew ? `<button class="btn ghost wide" type="button" data-act="tick" data-kind="todo" data-id="${esc(t.id)}" data-close="1">${t.done ? "Remettre à faire" : `${icon("check", 16)}Marquer comme fait`}</button>
@@ -389,13 +473,17 @@ function todoSheet(t) {
 function saveTodo(form) {
   const id = form.dataset.id || uid("d"); const prev = store.cache.todos[id] || {};
   const title = $("#tf-title").value.trim(); if (!title) return;
-  guard(store.set("todos", id, { ...prev, title, due: $("#tf-due").value || null, notes: $("#tf-notes").value.trim(),
+  const fsel = $("#tf-folder");
+  const folderId = fsel ? (fsel.value || null) : (prev.folderId !== undefined ? prev.folderId : (folderById(S.todoFolder) ? S.todoFolder : null));
+  guard(store.set("todos", id, { ...prev, title, due: $("#tf-due").value || null, notes: $("#tf-notes").value.trim(), folderId,
     done: !!prev.done, doneAt: prev.doneAt || null, createdAt: prev.createdAt || new Date().toISOString() }));
   closeSheet(); toast(prev.title ? "Modifié" : "Ajouté");
 }
 
+function shopScope() { const f = folderById(S.shopFolder); return S.groceries.filter(g => g.inList && inFolder(g, f && f.id)); }
 function renderShop() {
-  const list = S.groceries.filter(g => g.inList);
+  let f = folderById(S.shopFolder); if (!f) S.shopFolder = null;
+  const list = shopScope();
   const favs = S.groceries.filter(g => g.fav && !g.inList).sort((a, b) => a.name.localeCompare(b.name, "fr"));
   const groups = {}; list.forEach(g => { (groups[g.aisle || "Autre"] ||= []).push(g); });
   const ordered = AISLE_NAMES.filter(a => groups[a]);
@@ -403,25 +491,28 @@ function renderShop() {
   const focused = document.activeElement && document.activeElement.id === "g-name";
   const draftTxt = $("#g-name") ? $("#g-name").value : "";
   $("#v-shop").innerHTML = `
+    ${f ? folderHead("shop", f) : ""}
     <form class="quickadd" id="g-form" autocomplete="off">
-      <input type="text" id="g-name" placeholder="Il manque… (ex. lait, lessive)" aria-label="Article à ajouter" value="${esc(draftTxt)}" enterkeyhint="done">
+      <input type="text" id="g-name" placeholder="${f ? `Ajouter à « ${esc(f.name)} »…` : "Il manque… (ex. 2 lait, lessive)"}" aria-label="Article à ajouter" value="${esc(draftTxt)}" enterkeyhint="done">
       <button class="btn" type="submit">${icon("plus", 16)}Ajouter</button>
     </form>
-    ${favs.length ? `<div class="section-h"><span class="label">Habituels · un tap pour ajouter</span></div>
+    ${favs.length ? `<div class="section-h"><span class="label">Habituels · un tap pour ajouter${f ? " au dossier" : ""}</span></div>
       <div class="chips">${favs.map(g => `<button class="fav" data-act="g-readd" data-id="${esc(g.id)}">${icon("plus", 14)}${esc(g.name)}</button>`).join("")}</div>` : ""}
-    <div class="section-h"><h2>Liste du prochain drive</h2><span class="label num">${list.length} article${list.length > 1 ? "s" : ""}${checked ? ` · ${checked} au panier` : ""}</span></div>
+    ${f ? "" : folderCards("shop")}
+    <div class="section-h"><h2>${f ? "Articles" : "Liste du prochain drive"}</h2><span class="label num">${list.length} article${list.length > 1 ? "s" : ""}${checked ? ` · ${checked} au panier` : ""}</span></div>
     <div class="list">${ordered.length ? ordered.map(a => `<div class="aisle">${esc(a)}</div>` + groups[a].sort((x, y) => x.name.localeCompare(y.name, "fr")).map(g => `
       <div class="gitem${g.checked ? " checked" : ""}">
         <input type="checkbox" id="chk-${esc(g.id)}" data-act="g-check" data-id="${esc(g.id)}" ${g.checked ? "checked" : ""} aria-label="Mis au panier : ${esc(g.name)}">
         <label class="nm" for="chk-${esc(g.id)}">${esc(g.name)}</label>
+        <button class="qty${g.qty ? "" : " empty"}" data-act="g-qty" data-id="${esc(g.id)}" aria-label="${g.qty ? `Quantité : ${esc(g.qty)}, modifier` : "Ajouter une quantité"}">${g.qty ? esc(g.qty) : "+ qté"}</button>
         <button class="icobtn${g.fav ? " on" : ""}" data-act="g-fav" data-id="${esc(g.id)}" aria-label="${g.fav ? "Retirer des habituels" : "Ajouter aux habituels"}">${icon(g.fav ? "star" : "stare", 18)}</button>
         <button class="icobtn" data-act="g-remove" data-id="${esc(g.id)}" aria-label="Retirer de la liste">${icon("x", 16)}</button>
       </div>`).join("")).join("")
-      : `<div class="empty">La liste est vide. Ajoute un article dès qu'il manque quelque chose : elle sera prête le jour de la commande.</div>`}</div>
+      : `<div class="empty">${f ? "Ce dossier est vide. Ajoute les articles de la recette, du magasin ou du projet." : "La liste est vide. Ajoute un article dès qu'il manque quelque chose : elle sera prête le jour de la commande."}</div>`}</div>
     ${list.length ? `<div class="actions">
       <button class="btn ghost" data-act="g-copy">Copier la liste</button>
-      <button class="btn" data-act="g-ordered">Commande passée${checked ? ` (${checked})` : ""}</button></div>
-      <p class="hint">Coche les articles au fur et à mesure que tu les mets dans le panier du drive. « Commande passée » retire les articles cochés et garde les autres. Les articles étoilés restent dans tes habituels.</p>` : ""}`;
+      <button class="btn" data-act="g-ordered">${f ? "Courses faites" : "Commande passée"}${checked ? ` (${checked})` : ""}</button></div>
+      <p class="hint">Coche les articles au fur et à mesure que tu les mets dans le panier. « ${f ? "Courses faites" : "Commande passée"} » retire les articles cochés et garde les autres. Les articles étoilés restent dans tes habituels.</p>` : ""}`;
   if (focused) $("#g-name").focus();
 }
 
@@ -623,6 +714,68 @@ async function pushState() {
   if (sub) return "on";
   return Notification.permission === "denied" ? "denied" : "off";
 }
+/* ---------- thèmes du foyer ---------- */
+const THEMES = [
+  { id: "classic", name: "Classique" },
+  { id: "auto", name: "Au fil des saisons" },
+  { id: "spring", name: "Printemps" },
+  { id: "summer", name: "Été" },
+  { id: "autumn", name: "Automne" },
+  { id: "winter", name: "Hiver" }
+];
+function seasonNow() { const m = new Date().getMonth(); return m >= 2 && m <= 4 ? "spring" : m >= 5 && m <= 7 ? "summer" : m >= 8 && m <= 10 ? "autumn" : "winter"; }
+function resolvedTheme(st) { const t = (st && st.theme) || "classic"; return t === "auto" ? seasonNow() : t; }
+function applyTheme(st) {
+  st = st || {};
+  const t = resolvedTheme(st);
+  if (t === "classic") delete document.documentElement.dataset.season; else document.documentElement.dataset.season = t;
+  const bg = $("#bgimg");
+  if (st.bg) {
+    bg.style.backgroundImage = `url("${st.bg}")`; bg.hidden = false;
+    document.documentElement.style.setProperty("--veil", String(st.veil ?? 0.72));
+    document.documentElement.classList.add("has-bg");
+  } else { bg.hidden = true; bg.style.backgroundImage = ""; document.documentElement.classList.remove("has-bg"); }
+  requestAnimationFrame(() => { const c = getComputedStyle(document.documentElement).getPropertyValue("--bg").trim(); if (c) document.querySelectorAll('meta[name="theme-color"]').forEach(m => m.setAttribute("content", c)); });
+}
+async function saveSettings(patch, okMsg) {
+  const h = S.household; if (!h) return;
+  const prev = h.settings || {};
+  const next = { ...prev, ...patch };
+  h.settings = next; applyTheme(next); LS.set("households", S.households);
+  const { error } = await sb.from("households").update({ settings: next }).eq("id", h.id);
+  if (error) {
+    h.settings = prev; applyTheme(prev); LS.set("households", S.households);
+    toast(/settings/.test(error.message || "") ? "Relance d'abord le script supabase/schema.sql (mise à jour v8)." : "L'enregistrement du thème a échoué.");
+    return false;
+  }
+  if (okMsg) toast(okMsg);
+  return true;
+}
+async function pickBackground(file) {
+  if (!file) return;
+  let img; try { img = await loadImage(file); } catch (e) { toast("Impossible de lire cette image."); return; }
+  // Compressée (1280 px max, JPEG) : stockée dans les réglages du foyer, partagée par ses membres
+  let url = scaled(img, 1280, .72);
+  if (url.length > 600000) url = scaled(img, 1000, .6);
+  const ok = await saveSettings({ bg: url }, "Image de fond appliquée au foyer");
+  if (ok) settingsSheet();
+}
+function themeSection(h) {
+  const st = h.settings || {};
+  const cur = st.theme || "classic";
+  return `<span class="label">Apparence du foyer</span>
+    <div class="themes">${THEMES.map(t => `<button class="tcard${cur === t.id ? " sel" : ""}" data-act="theme" data-v="${t.id}" aria-pressed="${cur === t.id}">
+        <span class="tdots" data-preview="${t.id === "auto" ? seasonNow() : t.id}"><i></i><i></i><i></i></span>
+        <span class="tname">${t.name}</span>${t.id === "auto" ? `<span class="tsub">${THEMES.find(x => x.id === seasonNow()).name} en ce moment</span>` : ""}</button>`).join("")}</div>
+    <div class="settings-row"><div class="main"><b>Image de fond</b><span class="hint">${st.bg ? "Visible par tous les membres du foyer." : "Une photo de ta maison, de ton jardin… Elle est partagée avec les membres du foyer."}</span></div>
+      ${st.bg ? `<div class="bgthumb" style="background-image:url('${st.bg}')"></div>` : ""}</div>
+    <div class="actions">
+      <label class="btn ghost filebtn">${icon("cam", 16)}${st.bg ? "Changer la photo" : "Choisir une photo"}<input type="file" id="bg-file" accept="image/*"></label>
+      ${st.bg ? `<button class="btn ghost" data-act="bg-remove">Retirer</button>` : ""}
+    </div>
+    ${st.bg ? `<label class="field"><span>Voile sur la photo (lisibilité)</span><input type="range" id="bg-veil" min="0.45" max="0.92" step="0.01" value="${st.veil ?? 0.72}"></label>` : ""}`;
+}
+
 async function settingsSheet() {
   const ps = await pushState();
   const h = S.household || {};
@@ -650,6 +803,8 @@ async function settingsSheet() {
     </div>
     <button class="btn danger wide" data-act="hh-leave">Quitter ce foyer</button>
 
+    ${themeSection(h)}
+
     <span class="label">Notifications</span>
     <div class="settings-row"><div class="main"><b>${pushText[0]}</b><span class="hint">${pushText[1]}</span></div>
       ${ps === "off" ? `<button class="btn" data-act="push-on">${icon("bell", 16)}Activer</button>` : ps === "on" ? `<button class="btn ghost" data-act="push-off">Désactiver</button>` : ""}</div>
@@ -660,6 +815,12 @@ async function settingsSheet() {
     <div class="settings-row"><div class="main"><span>${esc(S.user?.email || "")}</span>${PLANT_ID ? `<span class="hint">Identification des plantes par <a href="https://plantnet.org" target="_blank" rel="noopener">Pl@ntNet</a>.</span>` : ""}</div></div>
     <button class="btn danger wide" data-act="logout">Se déconnecter</button>`);
   const sw = $("#hh-switch"); if (sw) sw.addEventListener("change", () => { closeSheet(); switchHousehold(sw.value); });
+  const bf = $("#bg-file"); if (bf) bf.addEventListener("change", () => pickBackground(bf.files && bf.files[0]));
+  const veil = $("#bg-veil");
+  if (veil) {
+    veil.addEventListener("input", () => document.documentElement.style.setProperty("--veil", veil.value));
+    veil.addEventListener("change", () => saveSettings({ veil: +veil.value }));
+  }
   if (h.id && navigator.onLine) {
     const { data, error } = await sb.rpc("household_member_list", { h: h.id });
     const el = $("#hh-members");
@@ -710,11 +871,59 @@ function setTab(t) {
   try { localStorage.setItem("maison:tab", t); } catch (e) { }
 }
 
-function addGrocery(name) {
-  name = name.trim(); if (!name) return;
-  const ex = S.groceries.find(g => norm(g.name) === norm(name));
-  if (ex) { if (!ex.inList) guard(store.update("groceries", ex.id, { inList: true, checked: false })); else toast("Déjà dans la liste"); return; }
-  guard(store.set("groceries", uid("g"), { name: name.charAt(0).toUpperCase() + name.slice(1), aisle: guessAisle(name), inList: true, checked: false, fav: false, addedAt: new Date().toISOString() }));
+/* Quantités : « 2 lait », « lait x6 », « farine 500 g », « 1,5 kg pommes » */
+const UNIT_RE = "(?:kg|g|mg|l|cl|ml|pcs?|paquets?|boîtes?|bouteilles?|sachets?|tranches?)";
+function normQty(q) {
+  q = String(q || "").trim().replace(/\s+/g, " ");
+  if (!q) return "";
+  if (/^\d+([.,]\d+)?$/.test(q)) return "×" + q;                 // nombre seul → ×n
+  q = q.replace(/^[x×]\s*/i, "×");
+  return q.replace(/^(\d+(?:[.,]\d+)?)\s*(kg|g|mg|l|cl|ml)$/i, (_, n, u) => `${n} ${u.toLowerCase() === "l" ? "L" : u.toLowerCase()}`);
+}
+function parseQty(text) {
+  const t = text.trim();
+  const clean = n => n.replace(/^(de|d'|d’|des)\s*/i, "").trim() || n;
+  let m = t.match(new RegExp(`^(\\d+(?:[.,]\\d+)?)\\s*(${UNIT_RE}|x|×)?\\s+(.+)$`, "i"));
+  if (m && !/^\d/.test(m[3])) return { name: clean(m[3]), qty: normQty(m[2] && !/^[x×]$/i.test(m[2]) ? `${m[1]} ${m[2]}` : m[1]) };
+  m = t.match(/^(.+?)\s+[x×]\s*(\d+)$/i);
+  if (m) return { name: m[1], qty: normQty(m[2]) };
+  m = t.match(new RegExp(`^(.+?)\\s+(\\d+(?:[.,]\\d+)?)\\s*(${UNIT_RE})$`, "i"));
+  if (m) return { name: m[1], qty: normQty(`${m[2]} ${m[3]}`) };
+  m = t.match(/^(.+?)\s+(\d{1,2})$/);                              // « oeufs 12 » (petit nombre final)
+  if (m && +m[2] > 0 && +m[2] <= 24) return { name: m[1], qty: normQty(m[2]) };
+  return { name: t, qty: "" };
+}
+function addGrocery(raw) {
+  raw = raw.trim(); if (!raw) return;
+  const { name, qty } = parseQty(raw);
+  const fid = folderById(S.shopFolder) ? S.shopFolder : null;
+  const same = S.groceries.filter(g => norm(g.name) === norm(name));
+  const here = same.find(g => g.inList && (g.folderId || null) === fid && inFolder(g, fid));
+  if (here) {
+    if (qty && qty !== here.qty) { guard(store.update("groceries", here.id, { qty })); toast(`Quantité mise à jour : ${here.name} ${qty}`); }
+    else toast("Déjà dans la liste");
+    return;
+  }
+  const spare = same.find(g => !g.inList);
+  if (spare) { guard(store.update("groceries", spare.id, { inList: true, checked: false, folderId: fid, ...(qty ? { qty } : {}) })); return; }
+  guard(store.set("groceries", uid("g"), { name: name.charAt(0).toUpperCase() + name.slice(1), qty, aisle: guessAisle(name), inList: true, checked: false, fav: false, folderId: fid, addedAt: new Date().toISOString() }));
+}
+function qtySheet(g) {
+  const presets = ["×2", "×3", "×4", "×6", "500 g", "1 kg", "1 L"];
+  openSheet(`
+    <div class="sheet-head"><h2>Quantité</h2><button class="icobtn" data-act="close" aria-label="Fermer">${icon("x")}</button></div>
+    <p class="hint">${esc(g.name)}</p>
+    <form id="qty-form" class="view" style="padding:0" data-id="${esc(g.id)}">
+      <div class="qstep">
+        <button type="button" class="btn quiet" data-act="q-step" data-v="-1" aria-label="Moins un">−</button>
+        <input type="text" id="gq-qty" value="${esc(g.qty || "")}" placeholder="2, 500 g, 1 paquet…" aria-label="Quantité" inputmode="text">
+        <button type="button" class="btn quiet" data-act="q-step" data-v="1" aria-label="Plus un">+</button>
+      </div>
+      <div class="chips">${presets.map(q => `<button type="button" class="fav" data-act="q-set" data-v="${q}">${q}</button>`).join("")}</div>
+      <button class="btn wide" type="submit">Enregistrer</button>
+      ${g.qty ? `<button class="btn ghost wide" type="button" data-act="q-clear">Retirer la quantité</button>` : ""}
+    </form>`);
+  setTimeout(() => { const i = $("#gq-qty"); if (i) { i.focus(); i.select(); } }, 50);
 }
 
 document.addEventListener("click", e => {
@@ -738,7 +947,7 @@ document.addEventListener("click", e => {
     case "td-clear": {
       if (armed !== el) { armed = el; el.classList.add("danger", "armed"); el.textContent = "Confirmer : effacer les tâches faites"; break; }
       armed = null;
-      (async () => { for (const t of S.todos.filter(x => x.done)) { try { await store.remove("todos", t.id); } catch (err) { guard(Promise.reject(err)); return; } } toast("Tâches faites effacées"); })();
+      (async () => { for (const t of S.todos.filter(x => x.done && inFolder(x, folderById(S.todoFolder) ? S.todoFolder : null))) { try { await store.remove("todos", t.id); } catch (err) { guard(Promise.reject(err)); return; } } toast("Tâches faites effacées"); })();
       break;
     }
     case "new-task": taskSheet(null); break;
@@ -751,17 +960,40 @@ document.addEventListener("click", e => {
       if (armed !== el) { armed = el; el.classList.add("armed"); el.textContent = "Confirmer la suppression"; break; }
       guard(store.remove(el.dataset.col, id)); closeSheet(); toast("Supprimé"); break;
     }
-    case "g-readd": guard(store.update("groceries", id, { inList: true, checked: false })); break;
+    case "g-readd": guard(store.update("groceries", id, { inList: true, checked: false, folderId: folderById(S.shopFolder) ? S.shopFolder : null })); break;
+    case "theme": {
+      document.querySelectorAll(".tcard").forEach(b => { b.classList.toggle("sel", b === el); b.setAttribute("aria-pressed", String(b === el)); });
+      saveSettings({ theme: el.dataset.v }, `Thème « ${THEMES.find(t => t.id === el.dataset.v).name} » appliqué au foyer`); break;
+    }
+    case "bg-remove": saveSettings({ bg: null }, "Image de fond retirée").then(ok => { if (ok) settingsSheet(); }); break;
+    case "g-qty": { const g = S.groceries.find(x => x.id === id); if (g) qtySheet(g); break; }
+    case "q-set": $("#gq-qty").value = el.dataset.v; break;
+    case "q-step": {
+      const i = $("#gq-qty"); const m = (i.value || "").match(/^[×x]?\s*(\d+)(.*)$/i);
+      const n = Math.max(1, (m ? parseInt(m[1]) : 1) + +el.dataset.v), rest = m ? m[2] : "";
+      i.value = rest.trim() ? `${n}${rest}` : `×${n}`; break;
+    }
+    case "q-clear": guard(store.update("groceries", $("#qty-form").dataset.id, { qty: "" })); closeSheet(); break;
+    case "open-folder": if (el.dataset.kind === "todo") { S.todoFolder = id; renderTodos(); } else { S.shopFolder = id; renderShop(); } window.scrollTo(0, 0); break;
+    case "close-folder": if (el.dataset.kind === "todo") { S.todoFolder = null; renderTodos(); } else { S.shopFolder = null; renderShop(); } window.scrollTo(0, 0); break;
+    case "new-folder": folderSheet(el.dataset.kind, null); break;
+    case "edit-folder": { const f = folderById(id); if (f) folderSheet(f.kind, f); break; }
+    case "fo-color": document.querySelectorAll(".swatch").forEach(b => { b.classList.toggle("sel", b === el); b.setAttribute("aria-pressed", String(b === el)); }); $("#fo-color").value = el.dataset.v; break;
+    case "del-folder": {
+      if (armed !== el) { armed = el; el.classList.add("armed"); el.textContent = "Confirmer la suppression du dossier"; break; }
+      armed = null; deleteFolder(id); break;
+    }
     case "g-fav": { const g = S.groceries.find(x => x.id === id); if (g) guard(store.update("groceries", id, { fav: !g.fav })); break; }
     case "g-remove": {
       const g = S.groceries.find(x => x.id === id); if (!g) break;
-      if (g.fav) guard(store.update("groceries", id, { inList: false, checked: false })); else guard(store.remove("groceries", id)); break;
+      if (g.fav) guard(store.update("groceries", id, { inList: false, checked: false, folderId: null })); else guard(store.remove("groceries", id)); break;
     }
     case "g-check": { const g = S.groceries.find(x => x.id === id); if (g) guard(store.update("groceries", id, { checked: el.checked })); break; }
     case "g-copy": {
-      const list = S.groceries.filter(g => g.inList); const groups = {}; list.forEach(g => { (groups[g.aisle || "Autre"] ||= []).push(g.name); });
-      const text = AISLE_NAMES.filter(a => groups[a]).map(a => `${a}\n${groups[a].map(n => "- " + n).join("\n")}`).join("\n\n");
-      if (navigator.share && isStandalone()) { navigator.share({ title: "Liste de courses", text }).catch(() => { }); break; }
+      const cf = folderById(S.shopFolder);
+      const list = shopScope(); const groups = {}; list.forEach(g => { (groups[g.aisle || "Autre"] ||= []).push(g.qty ? `${g.name} ${g.qty}` : g.name); });
+      const text = (cf ? `${cf.name}\n\n` : "") + AISLE_NAMES.filter(a => groups[a]).map(a => `${a}\n${groups[a].map(n => "- " + n).join("\n")}`).join("\n\n");
+      if (navigator.share && isStandalone()) { navigator.share({ title: cf ? cf.name : "Liste de courses", text }).catch(() => { }); break; }
       const fallback = () => { openSheet(`<div class="sheet-head"><h2>Ta liste</h2><button class="icobtn" data-act="close" aria-label="Fermer">${icon("x")}</button></div><p class="hint">Sélectionne le texte puis copie-le.</p><textarea id="copy-area" rows="12" readonly>${esc(text)}</textarea>`); const a = $("#copy-area"); a.focus(); a.select(); };
       try { navigator.clipboard.writeText(text).then(() => toast("Liste copiée"), fallback); } catch (err) { fallback(); }
       break;
@@ -769,7 +1001,7 @@ document.addEventListener("click", e => {
     case "g-ordered": {
       // Ne retire que les articles cochés (mis au panier) ; les autres restent pour la prochaine commande.
       // Si rien n'est coché, on propose de tout vider (après confirmation).
-      const inList = S.groceries.filter(x => x.inList);
+      const inList = shopScope();
       const picked = inList.filter(x => x.checked);
       const targets = picked.length ? picked : inList;
       if (armed !== el) {
@@ -782,7 +1014,7 @@ document.addEventListener("click", e => {
       const left = inList.length - targets.length;
       (async () => {
         for (const g of targets) {
-          try { if (g.fav) await store.update("groceries", g.id, { inList: false, checked: false, lastBought: now }); else await store.remove("groceries", g.id); }
+          try { if (g.fav) await store.update("groceries", g.id, { inList: false, checked: false, folderId: null, lastBought: now }); else await store.remove("groceries", g.id); }
           catch (err) { guard(Promise.reject(err)); return; }
         }
         toast(left ? `Commande notée · ${left} article${left > 1 ? "s" : ""} non coché${left > 1 ? "s" : ""} gardé${left > 1 ? "s" : ""} pour la prochaine fois` : "Liste vidée, bonne commande !");
@@ -831,12 +1063,18 @@ document.addEventListener("submit", e => {
   else if (e.target.id === "g-form") { const v = $("#g-name").value; $("#g-name").value = ""; addGrocery(v); const i = $("#g-name"); if (i) { i.value = ""; i.focus(); } }
   else if (e.target.id === "td-form") { const v = $("#td-name").value; $("#td-name").value = ""; addTodo(v); const i = $("#td-name"); if (i) { i.value = ""; i.focus(); } }
   else if (e.target.id === "todo-form") saveTodo(e.target);
+  else if (e.target.id === "folder-form") saveFolder(e.target);
+  else if (e.target.id === "qty-form") { guard(store.update("groceries", e.target.dataset.id, { qty: normQty($("#gq-qty").value) })); closeSheet(); }
   else if (e.target.id === "login-form") signIn(e.target);
   else if (e.target.id === "signup-form") signUp(e.target);
   else if (e.target.id === "hh-create-form") createHousehold(e.target);
   else if (e.target.id === "hh-join-form") joinHousehold(e.target);
 });
-document.querySelectorAll("nav.tabs button").forEach(b => b.addEventListener("click", () => setTab(b.dataset.tab)));
+document.querySelectorAll("nav.tabs button").forEach(b => b.addEventListener("click", () => {
+  // Retoucher l'onglet courant referme le dossier ouvert
+  if (b.dataset.tab === S.tab) { if (S.tab === "todo" && S.todoFolder) { S.todoFolder = null; renderTodos(); } if (S.tab === "shop" && S.shopFolder) { S.shopFolder = null; renderShop(); } }
+  setTab(b.dataset.tab);
+}));
 $("#btn-settings").addEventListener("click", settingsSheet);
 
 /* ---------- login (e-mail + mot de passe) ---------- */
@@ -890,7 +1128,7 @@ const LS = {
   set(k, v) { try { localStorage.setItem("maison:" + k, JSON.stringify(v)); } catch (e) { } }
 };
 async function loadHouseholds() {
-  const { data, error } = await sb.from("households").select("id,name,invite_code,created_at").order("created_at");
+  const { data, error } = await sb.from("households").select("*").order("created_at");
   if (error) throw error;
   S.households = data || []; LS.set("households", S.households);
   return S.households;
@@ -901,7 +1139,7 @@ function showApp() {
 }
 function switchHousehold(id) {
   const h = S.households.find(x => x.id === id) || S.households[0]; if (!h) return;
-  S.household = h; LS.set("hid", h.id);
+  S.household = h; LS.set("hid", h.id); S.todoFolder = null; S.shopFolder = null; applyTheme(h.settings);
   store.unsubscribe(); store.hid = h.id; store.loadLocal();
   $("#today-label").textContent = new Date().toLocaleDateString("fr-FR", { weekday: "long", day: "numeric", month: "long" }) + " · " + h.name;
   showApp(); render();
@@ -1016,9 +1254,12 @@ else {
 window.addEventListener("online", () => { if (S.user && store.hid) { store.fetchAll().catch(() => { }); store.subscribe(); } });
 window.addEventListener("offline", () => setSync("off"));
 document.addEventListener("visibilitychange", () => {
-  if (document.visibilityState === "visible" && S.user && store.hid && navigator.onLine) { store.fetchAll().catch(() => { }); render(); }
+  if (document.visibilityState === "visible" && S.user && store.hid && navigator.onLine) {
+    store.fetchAll().catch(() => { }); render();
+    loadHouseholds().then(() => { const h = S.households.find(x => x.id === store.hid); if (h) { S.household = h; applyTheme(h.settings); } }).catch(() => { });
+  }
 });
-setInterval(() => { const d = todayStr(); if (d !== window.__d) { window.__d = d; render(); } }, 60000); window.__d = todayStr();
+setInterval(() => { const d = todayStr(); if (d !== window.__d) { window.__d = d; render(); if (S.household) applyTheme(S.household.settings); } }, 60000); window.__d = todayStr();
 // URL ?tab=courses depuis une notification ou un raccourci
 const qtab = new URLSearchParams(location.search).get("tab");
 if (qtab && TITLES[qtab]) try { localStorage.setItem("maison:tab", qtab); } catch (e) { }

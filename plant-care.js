@@ -126,11 +126,11 @@
 
   // Recherche aussi par nom courant (« basilic », « orchidée »)
   function lookupByName(text) {
-    const n = norm(text).normalize("NFD").replace(/[̀-ͯ]/g, "");
+    const n = norm(text).normalize("NFD").replace(/[\u0300-\u036f]/g, "");
     if (!n) return null;
     const direct = lookup(n);
     if (direct) return direct;
-    const hit = LIST.find(x => x.nom.toLowerCase().normalize("NFD").replace(/[̀-ͯ]/g, "").split(/\s*\/\s*/).some(part => part === n || n.startsWith(part) || (n.length >= 4 && part.startsWith(n))));
+    const hit = LIST.find(x => x.nom.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "").split(/\s*\/\s*/).some(part => part === n || n.startsWith(part) || (n.length >= 4 && part.startsWith(n))));
     return hit ? lookup(hit.latin) : null;
   }
 
